@@ -1,0 +1,366 @@
+{
+  "lenders": {
+    "federal": {
+      "displayName": "Federal Bank (BC / freshv2)",
+      "transport": {
+        "baseUrl": "http://localhost:9099",
+        "defaultTimeoutSeconds": 10,
+        "staticHeaders": {
+          "X-Client-Id": "rupeek-los-poc",
+          "Content-Type": "application/json"
+        }
+      },
+      "defaultRetry": {
+        "initialIntervalSeconds": 2,
+        "backoffCoefficient": 2.0,
+        "maximumAttempts": 3,
+        "nonRetryableErrorTypes": ["BUSINESS_REJECT"]
+      },
+      "stages": [
+        {
+          "name": "PRECHECK",
+          "steps": [
+            {
+              "name": "nameDobCheck",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/precheck/name-dob",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "name": "${ctx.customerName}",
+                  "dob": "${ctx.dob}"
+                },
+                "extract": {
+                  "nameDobStatus": "$.status"
+                },
+                "successWhen": { "path": "$.status", "op": "EQUALS", "value": "SUCCESS" }
+              }
+            },
+            {
+              "name": "dedupeCheck",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/precheck/dedupe",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "pan": "${ctx.pan}",
+                  "mobile": "${ctx.mobile}"
+                },
+                "extract": {
+                  "precheckDedupeFlag": "$.data.ddupe_flag",
+                  "precheckCustomerId": "$.data.customer_id",
+                  "aadhaarChecksNeeded": "$.data.aadhaar_checks_needed"
+                },
+                "successWhen": { "path": "$.status", "op": "EQUALS", "value": "SUCCESS" }
+              }
+            },
+            {
+              "name": "parallelChecks",
+              "mode": "PARALLEL",
+              "calls": [
+                {
+                  "name": "panValidation",
+                  "method": "POST",
+                  "path": "/precheck/pan",
+                  "request": {
+                    "requestId": "${ctx._requestId}",
+                    "pan": "${ctx.pan}"
+                  },
+                  "extract": { "panStatus": "$.status" },
+                  "successWhen": { "path": "$.panStatusCode", "op": "IN", "values": ["E"] },
+                  "businessRejectWhen": { "path": "$.panStatusCode", "op": "IN", "values": ["F", "I"] }
+                },
+                {
+                  "name": "unNameCheck",
+                  "method": "POST",
+                  "path": "/precheck/un-name",
+                  "request": {
+                    "requestId": "${ctx._requestId}",
+                    "name": "${ctx.customerName}"
+                  },
+                  "extract": { "unNameStatus": "$.status" },
+                  "successWhen": { "path": "$.status", "op": "EQUALS", "value": "S" }
+                },
+                {
+                  "name": "panAadhaarLink",
+                  "condition": { "ctx": "aadhaarChecksNeeded", "op": "EQUALS", "value": "true" },
+                  "method": "POST",
+                  "path": "/precheck/pan-aadhaar",
+                  "request": {
+                    "requestId": "${ctx._requestId}",
+                    "pan": "${ctx.pan}",
+                    "aadhaarRef": "${ctx.aadhaarRef}"
+                  },
+                  "extract": { "panAadhaarStatus": "$.status" },
+                  "successWhen": { "path": "$.status", "op": "IN", "values": ["SUCCESS", "NOT_APPLICABLE"] }
+                },
+                {
+                  "name": "mobileAadhaarLink",
+                  "condition": { "ctx": "aadhaarChecksNeeded", "op": "EQUALS", "value": "true" },
+                  "method": "POST",
+                  "path": "/precheck/mobile-aadhaar",
+                  "request": {
+                    "requestId": "${ctx._requestId}",
+                    "mobile": "${ctx.mobile}",
+                    "aadhaarRef": "${ctx.aadhaarRef}"
+                  },
+                  "extract": { "mobileAadhaarStatus": "$.status" },
+                  "successWhen": { "path": "$.status", "op": "IN", "values": ["SUCCESS", "NOT_APPLICABLE"] }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "STP",
+          "steps": [
+            {
+              "name": "dedupe",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/stp/dedupe",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "pan": "${ctx.pan}",
+                  "mobile": "${ctx.mobile}"
+                },
+                "extract": {
+                  "dedupeFlag": "$.ddupeFlag",
+                  "partialKyc": "$.partialKycFlag",
+                  "customerId": "$.lenderCustomerId"
+                },
+                "successWhen": { "path": "$.ddupeFlag", "op": "IN", "values": ["Y", "N"] }
+              }
+            },
+            {
+              "name": "customerCreation",
+              "mode": "SYNC",
+              "condition": { "ctx": "dedupeFlag", "op": "EQUALS", "value": "N" },
+              "call": {
+                "method": "POST",
+                "path": "/stp/customer-creation",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "name": "${ctx.customerName}",
+                  "pan": "${ctx.pan}",
+                  "dob": "${ctx.dob}"
+                },
+                "extract": {
+                  "customerId": "$.customerId",
+                  "partialKyc": "$.partialKycFlag"
+                },
+                "successWhen": { "path": "$.responseCode", "op": "EQUALS", "value": "00" },
+                "businessRejectWhen": { "path": "$.responseCode", "op": "IN", "values": ["06", "12"] }
+              }
+            },
+            {
+              "name": "dedupeRetry",
+              "mode": "POLL",
+              "condition": { "ctx": "customerId", "op": "BLANK" },
+              "pollIntervalSeconds": 10,
+              "maxAttempts": 10,
+              "onExhausted": "FAIL",
+              "call": {
+                "method": "POST",
+                "path": "/stp/dedupe-retry",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "pan": "${ctx.pan}"
+                },
+                "extract": { "customerId": "$.lenderCustomerId" },
+                "terminalWhen": { "path": "$.lenderCustomerId", "op": "NOT_BLANK" }
+              }
+            },
+            {
+              "name": "customerInfo",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/stp/customer-info",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "referenceNumber": "${ctx._requestId}",
+                  "customerId": "${ctx.customerId}",
+                  "loanRequestId": "${ctx.loanRequestId}"
+                },
+                "extract": { "customerInfoStatus": "$.status" },
+                "successWhen": { "path": "$.status", "op": "EQUALS", "value": "SUCCESS" }
+              }
+            },
+            {
+              "name": "accountInfo",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/stp/account-info",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "customerId": "${ctx.customerId}",
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "loanType": "LTN"
+                },
+                "extract": {
+                  "accountInfoStatus": "$.status",
+                  "loanAccountNumber": "$.loanAccountNumber"
+                },
+                "successWhen": { "path": "$.statusCode", "op": "IN", "values": ["200"] },
+                "businessRejectWhen": { "path": "$.statusCode", "op": "IN", "values": ["406"] }
+              }
+            },
+            {
+              "name": "loanStatus",
+              "mode": "POLL",
+              "pollIntervalSeconds": 10,
+              "maxAttempts": 30,
+              "onExhausted": "AWAIT_SIGNAL",
+              "exhaustedSignalName": "retryLoanStatus",
+              "call": {
+                "method": "GET",
+                "path": "/stp/loan-status",
+                "queryParams": {
+                  "loanRequestId": "${ctx.loanRequestId}",
+                  "customerId": "${ctx.customerId}"
+                },
+                "extract": { "fedLoanStatus": "$.loanStatus" },
+                "terminalWhen": { "path": "$.loanStatus", "op": "IN", "values": ["SUCCESS", "FAILURE"] },
+                "businessRejectWhen": { "path": "$.loanStatus", "op": "EQUALS", "value": "FAILURE" }
+              }
+            }
+          ]
+        },
+        {
+          "name": "FUND_TRANSFER",
+          "steps": [
+            {
+              "name": "eSignWait",
+              "mode": "AWAIT_SIGNAL",
+              "signalName": "pledgeCardReady",
+              "timeoutHours": 72
+            },
+            {
+              "name": "pledgeCardSend",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/ft/pledge-card",
+                "request": {
+                  "requestId": "${ctx._requestId}",
+                  "loanAccountNumber": "${ctx.loanAccountNumber}",
+                  "customerId": "${ctx.customerId}"
+                },
+                "extract": { "bpmNumber": "$.bpmNumber" },
+                "successWhen": { "path": "$.statusCode", "op": "IN", "values": ["200"] },
+                "businessRejectWhen": { "path": "$.statusCode", "op": "IN", "values": ["406"] }
+              }
+            },
+            {
+              "name": "fundTransferStatus",
+              "mode": "POLL",
+              "pollIntervalSeconds": 10,
+              "maxAttempts": 30,
+              "onExhausted": "AWAIT_SIGNAL",
+              "exhaustedSignalName": "retryFundTransferStatus",
+              "call": {
+                "method": "GET",
+                "path": "/ft/status",
+                "queryParams": {
+                  "loanAccountNumber": "${ctx.loanAccountNumber}"
+                },
+                "extract": {
+                  "fundTransferStatus": "$.status",
+                  "utr": "$.utr"
+                },
+                "terminalWhen": { "path": "$.status", "op": "IN", "values": ["SUCCESS", "FAILURE"] },
+                "businessRejectWhen": { "path": "$.status", "op": "EQUALS", "value": "FAILURE" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+
+    "demobank": {
+      "displayName": "DemoBank — added by config only, zero code change",
+      "transport": {
+        "baseUrl": "http://localhost:9099",
+        "defaultTimeoutSeconds": 8,
+        "staticHeaders": {
+          "X-Client-Id": "rupeek-los-poc",
+          "Content-Type": "application/json"
+        }
+      },
+      "defaultRetry": {
+        "initialIntervalSeconds": 1,
+        "backoffCoefficient": 2.0,
+        "maximumAttempts": 4,
+        "nonRetryableErrorTypes": ["BUSINESS_REJECT"]
+      },
+      "stages": [
+        {
+          "name": "PRECHECK",
+          "steps": [
+            {
+              "name": "combinedPrecheck",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/precheck",
+                "request": {
+                  "ref": "${ctx._requestId}",
+                  "pan": "${ctx.pan}",
+                  "mobile": "${ctx.mobile}"
+                },
+                "extract": { "customerId": "$.custRef" },
+                "successWhen": { "path": "$.verdict", "op": "EQUALS", "value": "PASS" }
+              }
+            }
+          ]
+        },
+        {
+          "name": "STP",
+          "steps": [
+            {
+              "name": "sanction",
+              "mode": "POLL",
+              "pollIntervalSeconds": 10,
+              "maxAttempts": 20,
+              "onExhausted": "FAIL",
+              "call": {
+                "method": "GET",
+                "path": "/sanction/status",
+                "queryParams": { "custRef": "${ctx.customerId}" },
+                "extract": { "sanctionStatus": "$.state" },
+                "terminalWhen": { "path": "$.state", "op": "IN", "values": ["APPROVED", "DECLINED"] },
+                "businessRejectWhen": { "path": "$.state", "op": "EQUALS", "value": "DECLINED" }
+              }
+            }
+          ]
+        },
+        {
+          "name": "FUND_TRANSFER",
+          "steps": [
+            {
+              "name": "disburse",
+              "mode": "SYNC",
+              "call": {
+                "method": "POST",
+                "path": "/disburse",
+                "request": { "custRef": "${ctx.customerId}" },
+                "extract": { "utr": "$.utr" },
+                "successWhen": { "path": "$.ok", "op": "EQUALS", "value": "true" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
