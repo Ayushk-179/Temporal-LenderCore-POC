@@ -166,7 +166,12 @@ curl "localhost:9099/_set?KEY=VALUE" # flip a knob (also resets counters)
 
 | Knob | Default | Effect |
 |---|---|---|
-| `panStatusCode` | `E` | `F` or `I` → business reject at `panValidation` |
+| `panStatusCode` | `E` | `F`/`I` → **business reject**; any other value (e.g. `X`) → `successWhen` miss → **technical failure** |
+| `panHttp` | `200` | `500` → technical failure on the pan branch |
+| `unNameStatus` | `S` | anything else → `successWhen` miss → technical failure |
+| `unNameHttp` | `200` | `500` → technical failure on the un-name branch |
+| `panAadhaarHttp` | `200` | `500` → technical failure on that branch |
+| `mobileAadhaarHttp` | `200` | `500` → technical failure on that branch |
 | `aadhaarChecksNeeded` | `true` | `false` → parallel fan-out runs 2 branches, not 4 |
 | `precheckDedupeFlag` | `N` | precheck dedupe result |
 | `dedupeFlag` | `N` | `Y` → `customerCreation` + `dedupeRetry` both `SKIPPED` |
@@ -176,6 +181,29 @@ curl "localhost:9099/_set?KEY=VALUE" # flip a knob (also resets counters)
 | `dedupeHttp` | `200` | `500` → technical failure, 2s→4s→8s backoff, then FAILED |
 | `accountInfoStatus` | `200` | `406` → business reject at `accountInfo` |
 | `sanctionApprovesAfter` | `2` | demobank sanction poll |
+
+### Parallel-branch failure semantics
+
+`Promise.allOf(...).get()` is **fail-fast**, and `ctx.putAll(...)` runs *after* it
+(`LenderFlowWorkflowImpl.java:171-176`). Consequences:
+
+- The first branch to fail aborts the whole step.
+- **No branch's `extract` values reach the context — not even from branches that
+  succeeded.** A partial fan-out yields nothing.
+- `failedAt` records `PRECHECK/parallelChecks` only; the failing branch name
+  appears in `reason`, not `failedAt`.
+- Sibling activities are not proactively cancelled; the workflow returns and the
+  server discards their results.
+- There is no "optional branch" / continue-on-failure option in config. Parallel
+  groups are all-or-nothing.
+
+| | Technical failure | Business rejection |
+|---|---|---|
+| Failure type | `TECHNICAL_FAILURE` | `BUSINESS_REJECT` |
+| Retries | 3 attempts, 2s → 4s backoff | **none** (non-retryable) |
+| Time to fail | ~6s+ | immediate |
+| `outcome` | `FAILED` | `REJECTED` |
+| History | 3 × `ACTIVITY_TASK_STARTED` | 1 × `ACTIVITY_TASK_STARTED` |
 
 ### The scenario matrix
 
@@ -358,3 +386,221 @@ pkill -f "com.rupeek.poc.temporal.Runner"   # workers
 pkill -f mock_lender.py                     # mock
 pkill -f "temporal server start-dev"        # server
 ```
+
+---
+
+## 10. Architecture — how Temporal is working here
+
+Three tiers, and one inversion that explains most of the operational properties.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  TEMPORAL SERVER (4 services + persistence)             │
+│                                                          │
+│   Frontend ── gRPC API (start, signal, query)           │
+│   History  ── owns event history, shard-partitioned     │
+│   Matching ── hosts the task queues                     │
+│   Worker   ── internal housekeeping (not yours)         │
+│                                                          │
+│   Persistence: Cassandra / Postgres / MySQL             │
+│   Visibility:  Elasticsearch (search attributes)        │
+└────────────────────────┬────────────────────────────────┘
+                         │  workers LONG-POLL outbound
+                         │  (server never dials in)
+        ┌────────────────┴────────────────┐
+        │                                 │
+┌───────▼─────────┐              ┌────────▼────────┐
+│ lih-federal-work│              │lih-demobank-work│
+│  ├ workflow q   │              │  ├ workflow q   │
+│  └ activity q   │              │  └ activity q   │
+└───────┬─────────┘              └────────┬────────┘
+        │                                 │
+┌───────▼─────────────────┐      ┌────────▼────────────────┐
+│ YOUR JAR × N replicas   │      │ YOUR JAR × M replicas   │
+│  LenderFlowWorkflowImpl │      │  (identical code)       │
+│  StageActivityImpl      │      │                         │
+└─────────────────────────┘      └─────────────────────────┘
+```
+
+**The inversion:** workers long-poll *outbound*. The server never opens a
+connection to a worker. No inbound ports, no load balancer in front of workers,
+no service discovery — workers can sit behind NAT. This is why "add a worker" is
+genuinely just "run another pod": there is nothing to register.
+
+**Task queues are not a broker.** No SQS, no Kafka, no RabbitMQ.
+`lih-federal-work` is a logical name inside the Matching service. Creating one is
+free and implicit — it is never provisioned. `Runner.taskQueue()` (`:33`) just
+builds a string. That is the "per-lender isolation with no new infra" claim, and
+it is literally true.
+
+Each queue name hosts **two** independent queues:
+
+```
+TaskQueueType  workflow   <- "run the workflow code forward"
+TaskQueueType  activity   <- "execute this activity"
+```
+
+### The loop, traced through real event history
+
+Using `loanStatus` poll #1 (events 59–66 of an actual run):
+
+| Step | Who | What |
+|---|---|---|
+| 1 | Worker (workflow poller) | Picks up a Workflow Task, **replays `run()` from the top** against history, reaches the poll loop |
+| 2 | Worker | Returns **commands**, not results: `ScheduleActivityTask` |
+| 3 | History svc | Writes event 59 `ACTIVITY_TASK_SCHEDULED`, enqueues on the activity queue |
+| 4 | Worker (activity poller) | Runs `StageActivityImpl.execute()` — the **only** place a socket opens |
+| 5 | History svc | Events 60–61: started, completed with `{fedLoanStatus: PENDING, terminal: false}` |
+| 6 | Worker | New Workflow Task → replay → `terminal` false → `Workflow.sleep(10s)` → returns `StartTimer` |
+| 7 | History svc | Event 65 `TIMER_STARTED`; 10s later event 66 `TIMER_FIRED` |
+| 8 | | back to step 1 |
+
+**Workflow code produces commands; it never performs I/O.** That is the
+determinism contract, and why `Workflow.sleep` survives a pod kill — the timer
+lives in the History service, not in the JVM.
+
+### Sticky execution
+
+After the first workflow task, history shows:
+
+```json
+"taskQueue": {
+  "name": "89252@HOST:3d6ba125-c5c2-48a4-b2df-e7ff058857d2",
+  "kind": "TASK_QUEUE_KIND_STICKY",
+  "normalName": "lih-federal-work"
+}
+```
+
+The server routes subsequent workflow tasks to *that specific worker*, which has
+the workflow state cached, and sends only the **new** events instead of the full
+history. If that worker dies, the sticky task times out
+(`stickyQueueScheduleToStartTimeout`), the task falls back to the normal queue,
+and **any** worker replays from event 1. State lives in the server; the cache is
+only a cache. That is the durability demo, mechanically.
+
+---
+
+### Scaling by layer
+
+#### Application code — flat
+
+One `LenderFlowWorkflowImpl`, one `StageActivityImpl`, zero lender names. Code
+volume is **O(1) in lender count**; only `lender-config.json` grows. `demobank`
+running a different stage graph on the same JAR is the proof.
+
+What *does* force a code change: a new **execution mode** (a fifth case in the
+`switch` at `:96`), a new **predicate op**, or a new **signal name** (the
+hardcoded switch at `:238`). Interpreter changes — rare. Everything else is
+config or a T3 handler.
+
+#### Worker — horizontal and stateless
+
+N replicas of the identical JAR on the same queue. No coordination, no leader
+election, no partition assignment, no rebalancing.
+
+Per-worker knobs (all verified present in SDK 1.25.2):
+
+| Knob | Controls |
+|---|---|
+| `setMaxConcurrentActivityExecutionSize` | activities in flight per worker |
+| `setMaxConcurrentWorkflowTaskExecutionSize` | workflow tasks in flight |
+| `setMaxConcurrentActivityTaskPollers` / `WorkflowTaskPollers` | poller threads (observed: 5 each by default) |
+| `setMaxWorkerActivitiesPerSecond` | rate limit, **this worker** |
+| `setMaxTaskQueueActivitiesPerSecond` | rate limit, **whole fleet on this queue** |
+
+`Runner.worker()` (`:70`) passes no `WorkerOptions` — pure defaults. Fine for a
+POC; production wants these tuned.
+
+**Critical property for this workload:** it is I/O-bound on bank endpoints, not
+CPU-bound. And a *parked* workflow costs a worker **nothing** — `eSignWait` holds
+no thread, no memory, no connection. Ten thousand loans sitting at e-sign for
+three days consume zero worker capacity. Sizing is driven by *active* activity
+concurrency, not by how many loans are open. That is the biggest difference from
+a thread-per-request or poll-loop-service design.
+
+#### Task queue — the isolation boundary
+
+`lih-<slug>-work` per lender buys four things:
+
+1. **Blast radius.** If Federal's endpoint goes to 30s latency, Federal's
+   activity slots fill up. On a *shared* queue those slow activities would occupy
+   every worker's slots and starve other lenders — head-of-line blocking.
+   Separate queues make that structurally impossible.
+2. **Independent scale.** Federal 20 pods, demobank 1.
+3. **Independent deploy.** Roll interpreter changes to one lender's fleet first.
+   With Worker Versioning, that is the safe-migration story.
+4. **Per-lender rate limiting.** `setMaxTaskQueueActivitiesPerSecond` is a
+   **fleet-wide** limit across all workers on that queue. Banks impose TPS caps;
+   this honours them with no distributed rate limiter and no Redis token bucket.
+   Given the design being replaced is SQS-FIFO-per-lender + KEDA, this is the
+   strongest single line in the comparison.
+
+#### Server — the part that needs planning
+
+- `numHistoryShards` is **immutable after cluster creation**. Pick 512+. It is
+  the one decision that cannot be walked back.
+- History service scales with shards; Frontend and Matching scale horizontally.
+- **Persistence is almost always the bottleneck**, not Temporal itself.
+- Elasticsearch is required for search attributes — i.e. required for the ops
+  queries that replace Operate.
+
+Temporal Cloud removes all of this operationally (ap-south-1 available), at the
+cost of per-action billing.
+
+---
+
+### Scaling per lender — three topologies
+
+**A. One deployment per lender.** Max isolation: separate pods, JVMs, scaling
+policies, deploy cadence. Cost: 15 deployments for 15 lenders.
+
+**B. One deployment, many queues in one process.** A single worker process can
+host multiple task queues — call `factory.newWorker()` once per slug before
+`factory.start()`:
+
+```java
+for (String slug : slugs) {
+    Worker w = factory.newWorker(taskQueue(slug));
+    w.registerWorkflowImplementationTypes(LenderFlowWorkflowImpl.class);
+    w.registerActivitiesImplementations(new StageActivityImpl());
+}
+```
+
+Fewer pods, queue-level slot isolation preserved. But JVM-level failures (OOM, GC
+pause, bad deploy) hit every lender in that process.
+
+**C. Tiered — recommended.** High-volume lenders (Federal) get their own
+deployment; the long tail shares one multi-queue deployment. Real isolation where
+volume justifies it, pod economy where it does not. Promoting a lender from the
+shared pool to its own deployment is a config change plus a deploy — no code.
+
+`Runner` supports A and C today (`worker <slug>`); B is the ~6-line loop above.
+
+---
+
+### What will actually limit this, in order of likelihood
+
+**1. Poll loops dominate the event budget.** A real run produced **76 events for
+a flow that polled twice**. Each poll cycle costs ~8 events (activity
+scheduled/started/completed + workflow task scheduled/started/completed + timer
+started/fired). At `maxAttempts: 30`, one `loanStatus` loop is ~240 events; with
+`fundTransferStatus` too, a single slow loan approaches ~500. On **Temporal Cloud
+actions are the billing unit**, so poll interval and `maxAttempts` are commercial
+decisions, not just latency ones. Measure this before quoting a cost.
+
+**2. The manual-retry loop is unbounded.** `runPoll` (`:212`) does
+`attempt = 0; continue;` after the retry signal. Nothing caps how many times ops
+can hit retry, and each cycle adds ~240 events. Temporal's history limits
+(defaults on the order of ~50K events / ~50MB, configurable) would eventually
+terminate the workflow. Unlikely in practice, but unbounded *by design*; the
+standard fix is `Workflow.continueAsNew` to start a fresh history carrying
+context forward. Name it as known-and-mitigable.
+
+**3. Activity input duplication.** Every activity input re-sends the full `call`
+config, `transport`, and accumulated `context` — history grew 473 → 34,325 bytes
+across a 14-step flow. Scales as `steps × context size`, and context only grows.
+Harmless now; it is the mechanism that meets the ~2MB payload ceiling once T3
+stages carry image references.
+
+None are blockers. They are the three numbers a skeptical reviewer will probe:
+*what does one loan cost, and what stops it growing unbounded?*

@@ -14,7 +14,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 STATE = {
-    "panStatusCode":        "E",      # E=pass, F/I=business reject
+    "panStatusCode":        "E",      # E=pass, F/I=business reject, anything else=successWhen miss
+    "panHttp":              "200",    # 500 => technical failure on the pan branch
+    "unNameStatus":         "S",      # S=pass; anything else=successWhen miss
+    "unNameHttp":           "200",    # 500 => technical failure on the un-name branch
+    "panAadhaarHttp":       "200",
+    "mobileAadhaarHttp":    "200",
     "aadhaarChecksNeeded":  "true",   # false => parallel fan-out 4 -> 2
     "precheckDedupeFlag":   "N",
     "dedupeFlag":           "N",      # Y => customerCreation + dedupeRetry SKIPPED
@@ -42,10 +47,24 @@ def route(method, path):
             "customer_id": "",
             "aadhaar_checks_needed": s["aadhaarChecksNeeded"]}}
     if path == "/precheck/pan":
+        code = _int("panHttp", 200)
+        if code >= 500:
+            return code, {"error": "simulated pan outage"}
         return 200, {"panStatusCode": s["panStatusCode"], "status": "SUCCESS"}
     if path == "/precheck/un-name":
-        return 200, {"status": "S"}
-    if path in ("/precheck/pan-aadhaar", "/precheck/mobile-aadhaar"):
+        code = _int("unNameHttp", 200)
+        if code >= 500:
+            return code, {"error": "simulated un-name outage"}
+        return 200, {"status": s["unNameStatus"]}
+    if path == "/precheck/pan-aadhaar":
+        code = _int("panAadhaarHttp", 200)
+        if code >= 500:
+            return code, {"error": "simulated pan-aadhaar outage"}
+        return 200, {"status": "SUCCESS"}
+    if path == "/precheck/mobile-aadhaar":
+        code = _int("mobileAadhaarHttp", 200)
+        if code >= 500:
+            return code, {"error": "simulated mobile-aadhaar outage"}
         return 200, {"status": "SUCCESS"}
     # ---------------- federal / STP
     if path == "/stp/dedupe":
