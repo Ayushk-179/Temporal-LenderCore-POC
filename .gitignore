@@ -61,3 +61,6 @@ replay_pid*
 *.tmp
 *.swp
 *~
+
+# Generated config store (recreate with: Runner seed)
+config-store/

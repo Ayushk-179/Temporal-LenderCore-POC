@@ -15,6 +15,7 @@
     <temporal.version>1.25.2</temporal.version>
     <jackson.version>2.17.2</jackson.version>
     <junit.version>5.10.2</junit.version>
+    <mongo.version>4.2.3</mongo.version>
   </properties>
 
   <dependencies>
@@ -28,6 +29,16 @@
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
       <version>${jackson.version}</version>
+    </dependency>
+
+    <!--
+      Only needed when CONFIG_STORE=mongo. The default FileConfigStore has no
+      dependency at all, so the POC runs with nothing installed.
+    -->
+    <dependency>
+      <groupId>org.mongodb</groupId>
+      <artifactId>mongodb-driver-sync</artifactId>
+      <version>${mongo.version}</version>
     </dependency>
 
     <dependency>

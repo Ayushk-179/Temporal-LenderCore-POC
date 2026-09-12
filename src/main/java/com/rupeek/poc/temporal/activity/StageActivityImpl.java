@@ -2,10 +2,20 @@ package com.rupeek.poc.temporal.activity;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rupeek.poc.temporal.config.LenderConfig;
+import com.rupeek.poc.temporal.config.model.CallBinding;
+import com.rupeek.poc.temporal.config.model.FlowSkeleton;
+import com.rupeek.poc.temporal.config.model.Predicate;
+import com.rupeek.poc.temporal.config.model.Predicates;
+import com.rupeek.poc.temporal.config.model.ResolvedBinding;
+import com.rupeek.poc.temporal.config.model.StageKnobs;
+import com.rupeek.poc.temporal.config.model.Transport;
+import com.rupeek.poc.temporal.config.store.ConfigResolver;
+import com.rupeek.poc.temporal.config.store.ConfigStores;
+import com.rupeek.poc.temporal.config.template.JsonPaths;
+import com.rupeek.poc.temporal.config.template.TemplateRenderer;
+import com.rupeek.poc.temporal.config.template.UnresolvedTemplateException;
 import io.temporal.failure.ApplicationFailure;
 
-import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -14,55 +24,108 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
- * The ONLY place lender HTTP happens. Note what is NOT here: no per-lender
- * class, no if/else on slug. One executor, driven entirely by the Call config.
+ * The ONLY place lender HTTP happens. Note what is NOT here: no per-lender class,
+ * no if/else on slug. One executor, driven entirely by a CallBinding.
+ *
+ * The important change from the blob version: the binding is NOT handed in by the
+ * workflow any more — it is fetched from the store at the top of every attempt.
+ * A retry that starts 60 seconds after the previous one resolves config as it is
+ * NOW, so editing a payload template while a loan sits in backoff repairs it with
+ * no redeploy, no signal and no reset.
  */
 public class StageActivityImpl implements StageActivity {
 
     /** Failure type wired into RetryOptions.setDoNotRetry(...) — a rejection is not a fault. */
     public static final String BUSINESS_REJECT = "BUSINESS_REJECT";
     public static final String TECHNICAL_FAILURE = "TECHNICAL_FAILURE";
+    /**
+     * Bad config or an unresolvable template. Deliberately RETRYABLE: the retry
+     * ladder is the window in which an operator can fix the document and have the
+     * next attempt succeed on its own. If the ladder runs out, the step parks.
+     */
+    public static final String CONFIG_ERROR = "CONFIG_ERROR";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private final ConfigResolver config;
 
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
+    public StageActivityImpl() {
+        this(new ConfigResolver(ConfigStores.fromEnv()));
+    }
+
+    public StageActivityImpl(ConfigResolver config) {
+        this.config = config;
+    }
+
     @Override
-    public LenderConfig loadConfig() {
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("lender-config.json")) {
-            if (in == null) {
-                throw new IllegalStateException("lender-config.json not found on classpath");
-            }
-            return MAPPER.readValue(in, LenderConfig.class);
+    public FlowSkeleton loadFlowSkeleton(String lenderSlug) {
+        try {
+            return config.skeleton(lenderSlug);
+        } catch (ConfigResolver.ConfigMissingException e) {
+            throw ApplicationFailure.newNonRetryableFailure(e.getMessage(), CONFIG_ERROR);
         } catch (Exception e) {
-            throw ApplicationFailure.newFailure("Config load failed: " + e.getMessage(),
-                    TECHNICAL_FAILURE);
+            throw ApplicationFailure.newFailure(
+                    "skeleton load failed: " + e.getMessage(), CONFIG_ERROR);
+        }
+    }
+
+    @Override
+    public StageKnobs loadStageKnobs(String lenderSlug, String stageName) {
+        try {
+            return config.knobs(lenderSlug, stageName);
+        } catch (ConfigResolver.ConfigMissingException e) {
+            throw ApplicationFailure.newNonRetryableFailure(e.getMessage(), CONFIG_ERROR);
+        } catch (Exception e) {
+            throw ApplicationFailure.newFailure(
+                    "knobs load failed: " + e.getMessage(), CONFIG_ERROR);
         }
     }
 
     @Override
     public CallResult execute(CallRequest req) {
-        LenderConfig.Call call = req.call;
         String label = req.stageName + "/" + req.stepName
                 + (req.callName == null ? "" : "/" + req.callName);
 
-        String url = buildUrl(req);
-        String body = renderBody(call.request, req.context);
+        // ---- resolution point: EVERY attempt reads the store as it is right now
+        ResolvedBinding resolved;
+        try {
+            resolved = config.binding(req.lenderSlug, req.callKey);
+        } catch (ConfigResolver.ConfigMissingException e) {
+            throw ApplicationFailure.newFailure(label + " " + e.getMessage(), CONFIG_ERROR);
+        }
 
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(
-                        call.timeoutSeconds != null
-                                ? call.timeoutSeconds
-                                : req.transport.defaultTimeoutSeconds));
+        CallBinding call = resolved.binding;
+        Transport transport = resolved.transport;
 
-        req.transport.staticHeaders.forEach(b::header);
-        call.headers.forEach((k, v) -> b.header(k, resolve(v, req.context)));
+        String url;
+        String body;
+        HttpRequest.Builder b;
+        try {
+            url = buildUrl(transport, call, req.context);
+            body = renderBody(call, req.context);
+
+            b = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(call.timeoutSeconds != null
+                            ? call.timeoutSeconds
+                            : transport.defaultTimeoutSeconds));
+
+            transport.staticHeaders.forEach(b::header);
+            for (Map.Entry<String, String> h : call.headers.entrySet()) {
+                b.header(h.getKey(), TemplateRenderer.renderString(h.getValue(), req.context, true));
+            }
+        } catch (UnresolvedTemplateException e) {
+            // Retryable on purpose — see CONFIG_ERROR above.
+            throw ApplicationFailure.newFailure(
+                    label + " [binding " + resolved.bindingVersion + "] " + e.getMessage(),
+                    CONFIG_ERROR);
+        }
 
         if ("GET".equalsIgnoreCase(call.method)) {
             b.GET();
@@ -76,13 +139,15 @@ public class StageActivityImpl implements StageActivity {
         } catch (Exception e) {
             // Transient — let Temporal's retry policy handle it.
             throw ApplicationFailure.newFailure(
-                    label + " transport error: " + e.getMessage(), TECHNICAL_FAILURE);
+                    label + " transport error to " + url + ": " + e.getMessage(),
+                    TECHNICAL_FAILURE);
         }
 
         JsonNode json = parse(resp.body(), label);
 
         if (matches(call.businessRejectWhen, json, req.context)) {
-            // Non-retryable: the lender said no. Retrying cannot change the answer.
+            // Non-retryable: the lender said no. No retry and no config edit can
+            // change the answer, so this must never park either.
             throw ApplicationFailure.newNonRetryableFailure(
                     label + " rejected by lender", BUSINESS_REJECT, resp.body());
         }
@@ -96,12 +161,15 @@ public class StageActivityImpl implements StageActivity {
         out.callName = req.callName == null ? req.stepName : req.callName;
         out.httpStatus = resp.statusCode();
         out.rawResponseSnippet = snippet(resp.body());
-        out.extracted = extract(call.extract, json);
+        out.extracted = extract(call.extract, json, label);
         out.terminal = call.terminalWhen != null && matches(call.terminalWhen, json, req.context);
+        out.bindingVersion = resolved.bindingVersion;
+        out.transportVersion = resolved.transportVersion;
 
         if (call.successWhen != null && !matches(call.successWhen, json, req.context)) {
             throw ApplicationFailure.newFailure(
-                    label + " successWhen not satisfied: " + snippet(resp.body()),
+                    label + " successWhen not satisfied (HTTP " + resp.statusCode()
+                            + ", binding " + resolved.bindingVersion + "): " + snippet(resp.body()),
                     TECHNICAL_FAILURE);
         }
 
@@ -110,18 +178,21 @@ public class StageActivityImpl implements StageActivity {
 
     // ------------------------------------------------------------ internals
 
-    private String buildUrl(CallRequest req) {
-        StringBuilder sb = new StringBuilder(req.transport.baseUrl).append(req.call.path);
-        if (!req.call.queryParams.isEmpty()) {
+    /** The path is templated too, so "/loan/${ctx.loanId}/status" is expressible. */
+    private String buildUrl(Transport transport, CallBinding call, Map<String, String> ctx) {
+        StringBuilder sb = new StringBuilder(transport.baseUrl)
+                .append(TemplateRenderer.renderString(call.path, ctx, true));
+        if (!call.queryParams.isEmpty()) {
             sb.append('?');
             boolean first = true;
-            for (Map.Entry<String, String> e : req.call.queryParams.entrySet()) {
+            for (Map.Entry<String, String> e : call.queryParams.entrySet()) {
                 if (!first) {
                     sb.append('&');
                 }
                 sb.append(URLEncoder.encode(e.getKey(), StandardCharsets.UTF_8))
                         .append('=')
-                        .append(URLEncoder.encode(resolve(e.getValue(), req.context),
+                        .append(URLEncoder.encode(
+                                TemplateRenderer.renderString(e.getValue(), ctx, true),
                                 StandardCharsets.UTF_8));
                 first = false;
             }
@@ -129,34 +200,18 @@ public class StageActivityImpl implements StageActivity {
         return sb.toString();
     }
 
-    private String renderBody(Map<String, String> template, Map<String, String> ctx) {
-        Map<String, String> out = new LinkedHashMap<>();
-        template.forEach((k, v) -> out.put(k, resolve(v, ctx)));
+    private String renderBody(CallBinding call, Map<String, String> ctx) {
+        if (call.request == null || call.request.isNull()) {
+            return "";
+        }
         try {
-            return MAPPER.writeValueAsString(out);
+            return MAPPER.writeValueAsString(TemplateRenderer.render(call.request, ctx, true));
+        } catch (UnresolvedTemplateException e) {
+            throw e;
         } catch (Exception e) {
-            throw ApplicationFailure.newFailure("body render failed", TECHNICAL_FAILURE);
+            throw ApplicationFailure.newFailure("body render failed: " + e.getMessage(),
+                    CONFIG_ERROR);
         }
-    }
-
-    /** Resolves "${ctx.someKey}" against the context snapshot; passes literals through. */
-    static String resolve(String template, Map<String, String> ctx) {
-        if (template == null) {
-            return null;
-        }
-        String out = template;
-        int guard = 0;
-        while (out.contains("${ctx.") && guard++ < 20) {
-            int start = out.indexOf("${ctx.");
-            int end = out.indexOf('}', start);
-            if (end < 0) {
-                break;
-            }
-            String key = out.substring(start + 6, end);
-            String val = ctx.getOrDefault(key, "");
-            out = out.substring(0, start) + val + out.substring(end + 1);
-        }
-        return out;
     }
 
     private JsonNode parse(String body, String label) {
@@ -168,10 +223,15 @@ public class StageActivityImpl implements StageActivity {
         }
     }
 
-    private Map<String, String> extract(Map<String, String> spec, JsonNode json) {
+    private Map<String, String> extract(Map<String, String> spec, JsonNode json, String label) {
         Map<String, String> out = new LinkedHashMap<>();
         spec.forEach((key, path) -> {
-            String v = at(json, path);
+            String v;
+            try {
+                v = JsonPaths.extract(json, path);
+            } catch (IllegalArgumentException e) {
+                throw ApplicationFailure.newFailure(label + " " + e.getMessage(), CONFIG_ERROR);
+            }
             if (v != null) {
                 out.put(key, v);
             }
@@ -179,53 +239,12 @@ public class StageActivityImpl implements StageActivity {
         return out;
     }
 
-    /** "$.data.customer_id" -> node walk. No JSONPath dependency needed for the POC. */
-    static String at(JsonNode root, String path) {
-        if (root == null || path == null) {
-            return null;
-        }
-        String p = path.startsWith("$.") ? path.substring(2) : path;
-        JsonNode cur = root;
-        for (String seg : p.split("\\.")) {
-            if (cur == null) {
-                return null;
-            }
-            cur = cur.get(seg);
-        }
-        if (cur == null || cur.isNull()) {
-            return null;
-        }
-        return cur.isValueNode() ? cur.asText() : cur.toString();
-    }
-
-    private boolean matches(LenderConfig.Predicate p, JsonNode json, Map<String, String> ctx) {
+    private boolean matches(Predicate p, JsonNode json, Map<String, String> ctx) {
         if (p == null) {
             return false;
         }
-        String actual = p.path != null ? at(json, p.path) : ctx.get(p.ctx);
-        return evaluate(p, actual);
-    }
-
-    /** Shared with the workflow side so condition semantics cannot drift. */
-    public static boolean evaluate(LenderConfig.Predicate p, String actual) {
-        String op = p.op == null ? "EQUALS" : p.op.toUpperCase();
-        List<String> vals = p.values;
-        switch (op) {
-            case "EQUALS":
-                return actual != null && actual.equals(p.value);
-            case "NOT_EQUALS":
-                return actual == null || !actual.equals(p.value);
-            case "IN":
-                return actual != null && vals.contains(actual);
-            case "NOT_IN":
-                return actual == null || !vals.contains(actual);
-            case "BLANK":
-                return actual == null || actual.isBlank();
-            case "NOT_BLANK":
-                return actual != null && !actual.isBlank();
-            default:
-                throw new IllegalArgumentException("Unknown predicate op: " + op);
-        }
+        String actual = p.path != null ? JsonPaths.extract(json, p.path) : ctx.get(p.ctx);
+        return Predicates.evaluate(p, actual);
     }
 
     private static String snippet(String s) {

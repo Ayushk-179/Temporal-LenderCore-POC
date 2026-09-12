@@ -1,11 +1,18 @@
 # Fed Mendix flow on Temporal — POC
 
-One generic workflow. All lender specifics in `src/main/resources/lender-config.json`.
-Adding a lender is a config document, not a BPMN file plus 11 Java files.
+One generic workflow. All lender specifics live in an **external config store**,
+not in the jar. Adding a lender is a config document, not a BPMN file plus 11 Java
+files — and changing one does not need a redeploy.
 
-> **Not compiled.** This skeleton was written without a build environment. Expect
-> to fix import/signature nits on first `mvn compile`. The design is the deliverable;
-> the code is a head start.
+See **[CONFIG-DESIGN.md](CONFIG-DESIGN.md)** for the config architecture: the
+skeleton/binding split, why it is replay-safe, how the store is normalised per
+stage, and the list of production concerns this POC deliberately leaves unbuilt.
+
+> **Builds and runs.** `mvn test` is green (25 tests), and the full flow plus the
+> live hot-config-edit demo have been run end to end against `temporal server
+> start-dev` and the local mock. The design is still the deliverable — see
+> [CONFIG-DESIGN.md §7](CONFIG-DESIGN.md#7-what-was-not-built-and-why) for what a
+> production version needs and this does not have.
 
 ---
 
@@ -28,18 +35,28 @@ Adding a lender is a config document, not a BPMN file plus 11 Java files.
 brew install temporal          # or: https://docs.temporal.io/cli
 temporal server start-dev      # UI at http://localhost:8233
 
-# 2. Worker on the Federal task queue
+# 2. Seed the external config store from lender-config.json (one time)
+#    Normalises into 7 collections: one document per stage, one per call.
+#    Default is file-backed; for Mongo:
+#      docker run -d --name mongodb -p 27017:27017 mongo:7.0 && export CONFIG_STORE=mongo
 mvn -q compile
+mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="seed"
+mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="show federal"
+
+# 3. Worker on the Federal task queue
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker federal"
 
-# 3. Start a flow
+# 4. Start a flow
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
 
-# 4. Inspect live progress without touching a DB
+# 5. Inspect live progress, and which config versions it is running
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
 
-# 5. Release the e-sign wait (this is what PUT /v1/disbursement becomes)
+# 6. Release the e-sign wait (this is what PUT /v1/disbursement becomes)
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+
+# 7. Un-stick a step that parked after a bad config change (no redeploy)
+mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
 
 # Tests — the 1-hour poll loop runs in milliseconds
 mvn test
@@ -112,7 +129,7 @@ For the poll demos, temporarily drop `pollIntervalSeconds` to `10` and
 | New-arch component | Replaced by |
 |---|---|
 | `PendingCorrelation` store | workflow state |
-| `contextSnapshot` in Mongo | `loadConfig` activity result in event history |
+| `contextSnapshot` in Mongo | `loadFlowSkeleton` activity result in event history |
 | `poll_lock` in Redis | `Workflow.sleep` in the poll loop |
 | `ASYNC_RESUME` → re-enqueue | the loop never stopped |
 | `exec_lock:{slug}:{lr}:{stage}` | workflow ID + `WorkflowIdReusePolicy` |

@@ -28,8 +28,20 @@ public interface LenderFlowWorkflow {
     void retryFundTransferStatus();
 
     /**
+     * Release a step parked by onFailure=PARK.
+     *
+     * The recovery gesture this whole design exists for: a step has exhausted its
+     * retries, an operator has fixed the binding document in the store, and this
+     * signal re-runs the step. The re-run resolves config afresh, so it picks up
+     * the fix. No worker redeploy, no Temporal Reset, no manual compensation.
+     */
+    @SignalMethod
+    void retryStep();
+
+    /**
      * Live progress without Operate and without a DB read. This is what an ops
-     * screen or a support engineer calls to answer "where is this loan stuck".
+     * screen or a support engineer calls to answer "where is this loan stuck, and
+     * which config version is it running".
      */
     @QueryMethod
     FlowStatus status();
@@ -68,16 +80,24 @@ public interface LenderFlowWorkflow {
         public String status;
         public int attempts;
         public String detail;
+        /** Which binding version this step's call actually went out with. */
+        public String bindingVersion;
 
         public StepRecord() {
         }
 
         public StepRecord(String stage, String step, String status, int attempts, String detail) {
+            this(stage, step, status, attempts, detail, null);
+        }
+
+        public StepRecord(String stage, String step, String status, int attempts, String detail,
+                          String bindingVersion) {
             this.stage = stage;
             this.step = step;
             this.status = status;
             this.attempts = attempts;
             this.detail = detail;
+            this.bindingVersion = bindingVersion;
         }
     }
 
@@ -87,6 +107,14 @@ public interface LenderFlowWorkflow {
         public String currentStage;
         public String currentStep;
         public String waitingOnSignal;
+        /** "<STAGE>/<step>" when a step is parked awaiting retryStep, else null. */
+        public String parkedAt;
+
+        /** Config provenance, live. The pinned shape and the versions last used. */
+        public String skeletonVersion;
+        public String transportVersion;
+        public String lastBindingVersion;
+
         public List<StepRecord> history;
         public Map<String, String> context;
 

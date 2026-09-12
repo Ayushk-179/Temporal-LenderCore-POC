@@ -1,0 +1,1106 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-09-12T20:44:47.859Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "LenderFlowWorkflow"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJsb2FuUmVxdWVzdElkIjoiTFItRklYLXNlY29uZC1sZW5kZXIiLCJzZWVkIjp7ImN1c3RvbWVyTmFtZSI6IlRFU1QgQ1VTVE9NRVIiLCJwYW4iOiJBQUFQWjEyMzRDIiwibW9iaWxlIjoiOTAwMDAwMDAwMCIsImRvYiI6IjE5OTAtMDEtMTUiLCJhYWRoYWFyUmVmIjoiWFhYWC1YWFhYLTEyMzQifX0\u003d"
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "315360000s",
+        "workflowRunTimeout": "315360000s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "ea00057d-1ddf-41f0-90a3-821edc31405e",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "firstExecutionRunId": "ea00057d-1ddf-41f0-90a3-821edc31405e",
+        "attempt": 1,
+        "header": {}
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-09-12T20:44:47.859Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-09-12T20:44:47.861Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-09-12T20:44:47.877Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {
+          "langUsedFlags": [
+            1
+          ]
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-09-12T20:44:47.877Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "387ece0a-3950-3f63-9c4d-c639d94a204f",
+        "activityType": {
+          "name": "LoadFlowSkeleton"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "ImRlbW9iYW5rIg\u003d\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "20s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "3",
+        "retryPolicy": {
+          "initialInterval": "2s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "200s",
+          "maximumAttempts": 5
+        }
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-09-12T20:44:47.877Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "5",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-09-12T20:44:47.884Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJkaXNwbGF5TmFtZSI6IkRlbW9CYW5rIOKAlCBhZGRlZCBieSBjb25maWcgb25seSwgemVybyBjb2RlIGNoYW5nZSIsInZlcnNpb24iOiJ2MSIsInN0YWdlcyI6W3sibmFtZSI6IlBSRUNIRUNLIiwic3RlcHMiOlt7Im5hbWUiOiJjb21iaW5lZFByZWNoZWNrIiwibW9kZSI6IlNZTkMiLCJvbkJyYW5jaEZhaWx1cmUiOiJGQUlMIiwibWluU3VjY2VzcyI6MCwicG9sbEludGVydmFsU2Vjb25kcyI6MzAsIm1heEF0dGVtcHRzIjoxMCwib25FeGhhdXN0ZWQiOiJGQUlMIiwidGltZW91dEhvdXJzIjo3Miwib25GYWlsdXJlIjoiUEFSSyJ9XX0seyJuYW1lIjoiU1RQIiwic3RlcHMiOlt7Im5hbWUiOiJzYW5jdGlvbiIsIm1vZGUiOiJQT0xMIiwib25CcmFuY2hGYWlsdXJlIjoiRkFJTCIsIm1pblN1Y2Nlc3MiOjAsInBvbGxJbnRlcnZhbFNlY29uZHMiOjEwLCJtYXhBdHRlbXB0cyI6MjAsIm9uRXhoYXVzdGVkIjoiRkFJTCIsInRpbWVvdXRIb3VycyI6NzIsIm9uRmFpbHVyZSI6IlBBUksifV19LHsibmFtZSI6IkZVTkRfVFJBTlNGRVIiLCJzdGVwcyI6W3sibmFtZSI6ImRpc2J1cnNlIiwibW9kZSI6IlNZTkMiLCJvbkJyYW5jaEZhaWx1cmUiOiJGQUlMIiwibWluU3VjY2VzcyI6MCwicG9sbEludGVydmFsU2Vjb25kcyI6MzAsIm1heEF0dGVtcHRzIjoxMCwib25FeGhhdXN0ZWQiOiJGQUlMIiwidGltZW91dEhvdXJzIjo3Miwib25GYWlsdXJlIjoiUEFSSyJ9XX1dfQ\u003d\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "5",
+        "startedEventId": "6",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-09-12T20:44:47.884Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-09-12T20:44:47.884Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "8",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-09-12T20:44:47.888Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "8",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-09-12T20:44:47.888Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "33ddf6e5-60f8-37ba-ad45-05581286e119",
+        "activityType": {
+          "name": "LoadStageKnobs"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "ImRlbW9iYW5rIg\u003d\u003d"
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "IlBSRUNIRUNLIg\u003d\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "20s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "9",
+        "retryPolicy": {
+          "initialInterval": "2s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "200s",
+          "maximumAttempts": 5
+        }
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-09-12T20:44:47.888Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "11",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-09-12T20:44:47.892Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJ0cmFuc3BvcnRWZXJzaW9uIjoidDEiLCJzdGFnZSI6IlBSRUNIRUNLIiwicmV0cnkiOnsiaW5pdGlhbEludGVydmFsU2Vjb25kcyI6MSwiYmFja29mZkNvZWZmaWNpZW50IjoyLjAsIm1heGltdW1BdHRlbXB0cyI6NCwibm9uUmV0cnlhYmxlRXJyb3JUeXBlcyI6WyJCVVNJTkVTU19SRUpFQ1QiXX0sInRpbWVvdXRTZWNvbmRzIjo4fQ\u003d\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "11",
+        "startedEventId": "12",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-09-12T20:44:47.892Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-09-12T20:44:47.892Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "14",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-09-12T20:44:47.895Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "14",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-09-12T20:44:47.895Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "a6587768-d2d5-3de0-b5d0-0c83625eba4a",
+        "activityType": {
+          "name": "PRECHECK.combinedPrecheck"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJzdGFnZU5hbWUiOiJQUkVDSEVDSyIsInN0ZXBOYW1lIjoiY29tYmluZWRQcmVjaGVjayIsImNhbGxOYW1lIjoiY29tYmluZWRQcmVjaGVjayIsImNhbGxLZXkiOiJQUkVDSEVDSy5jb21iaW5lZFByZWNoZWNrIiwiY29udGV4dCI6eyJjdXN0b21lck5hbWUiOiJURVNUIENVU1RPTUVSIiwicGFuIjoiQUFBUFoxMjM0QyIsIm1vYmlsZSI6IjkwMDAwMDAwMDAiLCJkb2IiOiIxOTkwLTAxLTE1IiwiYWFkaGFhclJlZiI6IlhYWFgtWFhYWC0xMjM0IiwibG9hblJlcXVlc3RJZCI6IkxSLUZJWC1zZWNvbmQtbGVuZGVyIiwibGVuZGVyU2x1ZyI6ImRlbW9iYW5rIiwiX3JlcXVlc3RJZCI6IlJQSy1MUi1GSVgtc2Vjb25kLWxlbmRlci1jNDNkNzllOSJ9fQ\u003d\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "18s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "15",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "100s",
+          "maximumAttempts": 4,
+          "nonRetryableErrorTypes": [
+            "BUSINESS_REJECT"
+          ]
+        }
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-09-12T20:44:47.895Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "17",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "19",
+      "eventTime": "2026-09-12T20:44:47.897Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJjYWxsTmFtZSI6ImNvbWJpbmVkUHJlY2hlY2siLCJodHRwU3RhdHVzIjoyMDAsImV4dHJhY3RlZCI6eyJjb21iaW5lZFByZWNoZWNrU3RhdHVzIjoiU1VDQ0VTUyJ9LCJ0ZXJtaW5hbCI6ZmFsc2UsInJhd1Jlc3BvbnNlU25pcHBldCI6bnVsbCwiYmluZGluZ1ZlcnNpb24iOiJiMSIsInRyYW5zcG9ydFZlcnNpb24iOiJ0MSJ9"
+            }
+          ]
+        },
+        "scheduledEventId": "17",
+        "startedEventId": "18",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "20",
+      "eventTime": "2026-09-12T20:44:47.897Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "21",
+      "eventTime": "2026-09-12T20:44:47.897Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "20",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "22",
+      "eventTime": "2026-09-12T20:44:47.900Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "20",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "23",
+      "eventTime": "2026-09-12T20:44:47.900Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "517c386e-06a6-35da-9e84-bc1d4b4aa84b",
+        "activityType": {
+          "name": "LoadStageKnobs"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "ImRlbW9iYW5rIg\u003d\u003d"
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "IlNUUCI\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "20s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "21",
+        "retryPolicy": {
+          "initialInterval": "2s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "200s",
+          "maximumAttempts": 5
+        }
+      }
+    },
+    {
+      "eventId": "24",
+      "eventTime": "2026-09-12T20:44:47.900Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "23",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "25",
+      "eventTime": "2026-09-12T20:44:47.904Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJ0cmFuc3BvcnRWZXJzaW9uIjoidDEiLCJzdGFnZSI6IlNUUCIsInJldHJ5Ijp7ImluaXRpYWxJbnRlcnZhbFNlY29uZHMiOjEsImJhY2tvZmZDb2VmZmljaWVudCI6Mi4wLCJtYXhpbXVtQXR0ZW1wdHMiOjQsIm5vblJldHJ5YWJsZUVycm9yVHlwZXMiOlsiQlVTSU5FU1NfUkVKRUNUIl19LCJ0aW1lb3V0U2Vjb25kcyI6OH0\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "23",
+        "startedEventId": "24",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "26",
+      "eventTime": "2026-09-12T20:44:47.904Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "27",
+      "eventTime": "2026-09-12T20:44:47.904Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "26",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "28",
+      "eventTime": "2026-09-12T20:44:47.907Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "26",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "29",
+      "eventTime": "2026-09-12T20:44:47.907Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "a92efff0-9d38-33b0-867b-94ea17be1e51",
+        "activityType": {
+          "name": "STP.sanction"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJzdGFnZU5hbWUiOiJTVFAiLCJzdGVwTmFtZSI6InNhbmN0aW9uIiwiY2FsbE5hbWUiOiJzYW5jdGlvbiIsImNhbGxLZXkiOiJTVFAuc2FuY3Rpb24iLCJjb250ZXh0Ijp7ImN1c3RvbWVyTmFtZSI6IlRFU1QgQ1VTVE9NRVIiLCJwYW4iOiJBQUFQWjEyMzRDIiwibW9iaWxlIjoiOTAwMDAwMDAwMCIsImRvYiI6IjE5OTAtMDEtMTUiLCJhYWRoYWFyUmVmIjoiWFhYWC1YWFhYLTEyMzQiLCJsb2FuUmVxdWVzdElkIjoiTFItRklYLXNlY29uZC1sZW5kZXIiLCJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJjb21iaW5lZFByZWNoZWNrU3RhdHVzIjoiU1VDQ0VTUyIsIl9yZXF1ZXN0SWQiOiJSUEstTFItRklYLXNlY29uZC1sZW5kZXItMGVlOWI5YWEifX0\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "18s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "27",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "100s",
+          "maximumAttempts": 4,
+          "nonRetryableErrorTypes": [
+            "BUSINESS_REJECT"
+          ]
+        }
+      }
+    },
+    {
+      "eventId": "30",
+      "eventTime": "2026-09-12T20:44:47.907Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "29",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "31",
+      "eventTime": "2026-09-12T20:44:47.909Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJjYWxsTmFtZSI6InNhbmN0aW9uIiwiaHR0cFN0YXR1cyI6MjAwLCJleHRyYWN0ZWQiOnsic2FuY3Rpb25TdGF0dXMiOiJQRU5ESU5HIn0sInRlcm1pbmFsIjpmYWxzZSwicmF3UmVzcG9uc2VTbmlwcGV0IjpudWxsLCJiaW5kaW5nVmVyc2lvbiI6ImIxIiwidHJhbnNwb3J0VmVyc2lvbiI6InQxIn0\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "29",
+        "startedEventId": "30",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "32",
+      "eventTime": "2026-09-12T20:44:47.909Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "33",
+      "eventTime": "2026-09-12T20:44:47.910Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "32",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "34",
+      "eventTime": "2026-09-12T20:44:47.911Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "32",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "35",
+      "eventTime": "2026-09-12T20:44:47.911Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "timerStartedEventAttributes": {
+        "timerId": "b1ed950f-e6a6-3214-99b1-59b4512fd2be",
+        "startToFireTimeout": "10s",
+        "workflowTaskCompletedEventId": "33"
+      }
+    },
+    {
+      "eventId": "36",
+      "eventTime": "2026-09-12T20:44:57.912Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "timerFiredEventAttributes": {
+        "timerId": "b1ed950f-e6a6-3214-99b1-59b4512fd2be",
+        "startedEventId": "35"
+      }
+    },
+    {
+      "eventId": "37",
+      "eventTime": "2026-09-12T20:44:57.912Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "38",
+      "eventTime": "2026-09-12T20:44:57.912Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "37",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "39",
+      "eventTime": "2026-09-12T20:44:57.915Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "37",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "40",
+      "eventTime": "2026-09-12T20:44:57.915Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "95131ece-ef80-3dc4-ab82-048be9e57288",
+        "activityType": {
+          "name": "STP.sanction"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJzdGFnZU5hbWUiOiJTVFAiLCJzdGVwTmFtZSI6InNhbmN0aW9uIiwiY2FsbE5hbWUiOiJzYW5jdGlvbiIsImNhbGxLZXkiOiJTVFAuc2FuY3Rpb24iLCJjb250ZXh0Ijp7ImN1c3RvbWVyTmFtZSI6IlRFU1QgQ1VTVE9NRVIiLCJwYW4iOiJBQUFQWjEyMzRDIiwibW9iaWxlIjoiOTAwMDAwMDAwMCIsImRvYiI6IjE5OTAtMDEtMTUiLCJhYWRoYWFyUmVmIjoiWFhYWC1YWFhYLTEyMzQiLCJsb2FuUmVxdWVzdElkIjoiTFItRklYLXNlY29uZC1sZW5kZXIiLCJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJjb21iaW5lZFByZWNoZWNrU3RhdHVzIjoiU1VDQ0VTUyIsInNhbmN0aW9uU3RhdHVzIjoiUEVORElORyIsIl9yZXF1ZXN0SWQiOiJSUEstTFItRklYLXNlY29uZC1sZW5kZXItMDdkYjc2MDEifX0\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "18s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "38",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "100s",
+          "maximumAttempts": 4,
+          "nonRetryableErrorTypes": [
+            "BUSINESS_REJECT"
+          ]
+        }
+      }
+    },
+    {
+      "eventId": "41",
+      "eventTime": "2026-09-12T20:44:57.915Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "40",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "42",
+      "eventTime": "2026-09-12T20:44:57.918Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJjYWxsTmFtZSI6InNhbmN0aW9uIiwiaHR0cFN0YXR1cyI6MjAwLCJleHRyYWN0ZWQiOnsic2FuY3Rpb25TdGF0dXMiOiJQRU5ESU5HIn0sInRlcm1pbmFsIjpmYWxzZSwicmF3UmVzcG9uc2VTbmlwcGV0IjpudWxsLCJiaW5kaW5nVmVyc2lvbiI6ImIxIiwidHJhbnNwb3J0VmVyc2lvbiI6InQxIn0\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "40",
+        "startedEventId": "41",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "43",
+      "eventTime": "2026-09-12T20:44:57.918Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "44",
+      "eventTime": "2026-09-12T20:44:57.918Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "43",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "45",
+      "eventTime": "2026-09-12T20:44:57.921Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "43",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "46",
+      "eventTime": "2026-09-12T20:44:57.921Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "timerStartedEventAttributes": {
+        "timerId": "22e9f928-a557-3d45-a7db-0c0ee563cef8",
+        "startToFireTimeout": "10s",
+        "workflowTaskCompletedEventId": "44"
+      }
+    },
+    {
+      "eventId": "47",
+      "eventTime": "2026-09-12T20:45:07.921Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "timerFiredEventAttributes": {
+        "timerId": "22e9f928-a557-3d45-a7db-0c0ee563cef8",
+        "startedEventId": "46"
+      }
+    },
+    {
+      "eventId": "48",
+      "eventTime": "2026-09-12T20:45:07.921Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "49",
+      "eventTime": "2026-09-12T20:45:07.923Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "48",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "50",
+      "eventTime": "2026-09-12T20:45:07.926Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "48",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "51",
+      "eventTime": "2026-09-12T20:45:07.926Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "8432c8bf-7a51-3800-8e62-d12379cebc2c",
+        "activityType": {
+          "name": "STP.sanction"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJzdGFnZU5hbWUiOiJTVFAiLCJzdGVwTmFtZSI6InNhbmN0aW9uIiwiY2FsbE5hbWUiOiJzYW5jdGlvbiIsImNhbGxLZXkiOiJTVFAuc2FuY3Rpb24iLCJjb250ZXh0Ijp7ImN1c3RvbWVyTmFtZSI6IlRFU1QgQ1VTVE9NRVIiLCJwYW4iOiJBQUFQWjEyMzRDIiwibW9iaWxlIjoiOTAwMDAwMDAwMCIsImRvYiI6IjE5OTAtMDEtMTUiLCJhYWRoYWFyUmVmIjoiWFhYWC1YWFhYLTEyMzQiLCJsb2FuUmVxdWVzdElkIjoiTFItRklYLXNlY29uZC1sZW5kZXIiLCJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJjb21iaW5lZFByZWNoZWNrU3RhdHVzIjoiU1VDQ0VTUyIsInNhbmN0aW9uU3RhdHVzIjoiUEVORElORyIsIl9yZXF1ZXN0SWQiOiJSUEstTFItRklYLXNlY29uZC1sZW5kZXItNGQwMTEyNTQifX0\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "18s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "49",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "100s",
+          "maximumAttempts": 4,
+          "nonRetryableErrorTypes": [
+            "BUSINESS_REJECT"
+          ]
+        }
+      }
+    },
+    {
+      "eventId": "52",
+      "eventTime": "2026-09-12T20:45:07.926Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "51",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "53",
+      "eventTime": "2026-09-12T20:45:07.930Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJjYWxsTmFtZSI6InNhbmN0aW9uIiwiaHR0cFN0YXR1cyI6MjAwLCJleHRyYWN0ZWQiOnsic2FuY3Rpb25TdGF0dXMiOiJBUFBST1ZFRCJ9LCJ0ZXJtaW5hbCI6dHJ1ZSwicmF3UmVzcG9uc2VTbmlwcGV0IjpudWxsLCJiaW5kaW5nVmVyc2lvbiI6ImIxIiwidHJhbnNwb3J0VmVyc2lvbiI6InQxIn0\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "51",
+        "startedEventId": "52",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "54",
+      "eventTime": "2026-09-12T20:45:07.930Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "55",
+      "eventTime": "2026-09-12T20:45:07.930Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "54",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "56",
+      "eventTime": "2026-09-12T20:45:07.932Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "54",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "57",
+      "eventTime": "2026-09-12T20:45:07.932Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "78e62dab-6f0d-3586-b663-48839be8f065",
+        "activityType": {
+          "name": "LoadStageKnobs"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "ImRlbW9iYW5rIg\u003d\u003d"
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "IkZVTkRfVFJBTlNGRVIi"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "20s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "55",
+        "retryPolicy": {
+          "initialInterval": "2s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "200s",
+          "maximumAttempts": 5
+        }
+      }
+    },
+    {
+      "eventId": "58",
+      "eventTime": "2026-09-12T20:45:07.933Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "57",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "59",
+      "eventTime": "2026-09-12T20:45:07.935Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJ0cmFuc3BvcnRWZXJzaW9uIjoidDEiLCJzdGFnZSI6IkZVTkRfVFJBTlNGRVIiLCJyZXRyeSI6eyJpbml0aWFsSW50ZXJ2YWxTZWNvbmRzIjoxLCJiYWNrb2ZmQ29lZmZpY2llbnQiOjIuMCwibWF4aW11bUF0dGVtcHRzIjo0LCJub25SZXRyeWFibGVFcnJvclR5cGVzIjpbIkJVU0lORVNTX1JFSkVDVCJdfSwidGltZW91dFNlY29uZHMiOjh9"
+            }
+          ]
+        },
+        "scheduledEventId": "57",
+        "startedEventId": "58",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "60",
+      "eventTime": "2026-09-12T20:45:07.935Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "61",
+      "eventTime": "2026-09-12T20:45:07.935Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "60",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "62",
+      "eventTime": "2026-09-12T20:45:07.945Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "60",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "63",
+      "eventTime": "2026-09-12T20:45:07.945Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "dd194db1-d228-3caa-a021-642154282ebe",
+        "activityType": {
+          "name": "FUND_TRANSFER.disburse"
+        },
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJzdGFnZU5hbWUiOiJGVU5EX1RSQU5TRkVSIiwic3RlcE5hbWUiOiJkaXNidXJzZSIsImNhbGxOYW1lIjoiZGlzYnVyc2UiLCJjYWxsS2V5IjoiRlVORF9UUkFOU0ZFUi5kaXNidXJzZSIsImNvbnRleHQiOnsiY3VzdG9tZXJOYW1lIjoiVEVTVCBDVVNUT01FUiIsInBhbiI6IkFBQVBaMTIzNEMiLCJtb2JpbGUiOiI5MDAwMDAwMDAwIiwiZG9iIjoiMTk5MC0wMS0xNSIsImFhZGhhYXJSZWYiOiJYWFhYLVhYWFgtMTIzNCIsImxvYW5SZXF1ZXN0SWQiOiJMUi1GSVgtc2Vjb25kLWxlbmRlciIsImxlbmRlclNsdWciOiJkZW1vYmFuayIsImNvbWJpbmVkUHJlY2hlY2tTdGF0dXMiOiJTVUNDRVNTIiwic2FuY3Rpb25TdGF0dXMiOiJBUFBST1ZFRCIsIl9yZXF1ZXN0SWQiOiJSUEstTFItRklYLXNlY29uZC1sZW5kZXItZTgyODYxNTAifX0\u003d"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "18s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "61",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2.0,
+          "maximumInterval": "100s",
+          "maximumAttempts": 4,
+          "nonRetryableErrorTypes": [
+            "BUSINESS_REJECT"
+          ]
+        }
+      }
+    },
+    {
+      "eventId": "64",
+      "eventTime": "2026-09-12T20:45:07.945Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "63",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "65",
+      "eventTime": "2026-09-12T20:45:07.947Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJjYWxsTmFtZSI6ImRpc2J1cnNlIiwiaHR0cFN0YXR1cyI6MjAwLCJleHRyYWN0ZWQiOnsiZGlzYnVyc2VTdGF0dXMiOiJTVUNDRVNTIn0sInRlcm1pbmFsIjpmYWxzZSwicmF3UmVzcG9uc2VTbmlwcGV0IjpudWxsLCJiaW5kaW5nVmVyc2lvbiI6ImIxIiwidHJhbnNwb3J0VmVyc2lvbiI6InQxIn0\u003d"
+            }
+          ]
+        },
+        "scheduledEventId": "63",
+        "startedEventId": "64",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "66",
+      "eventTime": "2026-09-12T20:45:07.947Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "lih-demobank-work"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "67",
+      "eventTime": "2026-09-12T20:45:07.947Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "66",
+        "identity": "1688@MP--FVFG61V8Q05N"
+      }
+    },
+    {
+      "eventId": "68",
+      "eventTime": "2026-09-12T20:45:07.948Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "66",
+        "identity": "1688@MP--FVFG61V8Q05N",
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "69",
+      "eventTime": "2026-09-12T20:45:07.948Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg\u003d\u003d"
+              },
+              "data": "eyJvdXRjb21lIjoiQ09NUExFVEVEIiwiZmFpbGVkQXQiOm51bGwsInJlYXNvbiI6bnVsbCwiZmluYWxDb250ZXh0Ijp7ImN1c3RvbWVyTmFtZSI6IlRFU1QgQ1VTVE9NRVIiLCJwYW4iOiJBQUFQWjEyMzRDIiwibW9iaWxlIjoiOTAwMDAwMDAwMCIsImRvYiI6IjE5OTAtMDEtMTUiLCJhYWRoYWFyUmVmIjoiWFhYWC1YWFhYLTEyMzQiLCJsb2FuUmVxdWVzdElkIjoiTFItRklYLXNlY29uZC1sZW5kZXIiLCJsZW5kZXJTbHVnIjoiZGVtb2JhbmsiLCJjb21iaW5lZFByZWNoZWNrU3RhdHVzIjoiU1VDQ0VTUyIsInNhbmN0aW9uU3RhdHVzIjoiQVBQUk9WRUQiLCJkaXNidXJzZVN0YXR1cyI6IlNVQ0NFU1MifX0\u003d"
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "67"
+      }
+    }
+  ]
+}
