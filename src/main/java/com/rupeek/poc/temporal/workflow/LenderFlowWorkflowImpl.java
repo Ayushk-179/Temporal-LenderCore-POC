@@ -7,15 +7,17 @@ import io.temporal.activity.ActivityOptions;
 import io.temporal.common.RetryOptions;
 import io.temporal.failure.ActivityFailure;
 import io.temporal.failure.ApplicationFailure;
-import io.temporal.workflow.Async;
+import io.temporal.workflow.ActivityStub;
 import io.temporal.workflow.Promise;
 import io.temporal.workflow.Workflow;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * ONE workflow class for every lender.
@@ -65,8 +67,9 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         LenderConfig config = bootstrapActivities.loadConfig();
         LenderConfig.Lender lender = config.lender(lenderSlug);
 
-        StageActivity activities = Workflow.newActivityStub(
-                StageActivity.class, activityOptions(lender));
+        // Untyped stub: the activity TYPE name is supplied per call from config,
+        // so the UI timeline names each lender call instead of showing N x "Execute".
+        ActivityStub activities = Workflow.newUntypedActivityStub(activityOptions(lender));
 
         FlowResult result = new FlowResult();
 
@@ -107,6 +110,19 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
             result.failedAt = currentStage + "/" + currentStep;
             result.reason = rootMessage(af);
             history.add(new StepRecord(currentStage, currentStep, result.outcome, 0, result.reason));
+        } catch (ApplicationFailure af) {
+            // Thrown by the workflow itself — today only the PARALLEL gate, which has
+            // already decided REJECTED vs FAILED. Every other type (CONFIG_ERROR,
+            // POLL_EXHAUSTED, SIGNAL_TIMEOUT) still fails the execution loudly.
+            if (!StageActivityImpl.BUSINESS_REJECT.equals(af.getType())
+                    && !StageActivityImpl.TECHNICAL_FAILURE.equals(af.getType())) {
+                throw af;
+            }
+            result.outcome = StageActivityImpl.BUSINESS_REJECT.equals(af.getType())
+                    ? "REJECTED" : "FAILED";
+            result.failedAt = currentStage + "/" + currentStep;
+            result.reason = af.getOriginalMessage();
+            history.add(new StepRecord(currentStage, currentStep, result.outcome, 0, result.reason));
         }
 
         result.finalContext = new LinkedHashMap<>(ctx);
@@ -115,10 +131,11 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
 
     // ------------------------------------------------------------- step modes
 
-    private void runSync(StageActivity acts, LenderConfig.Lender lender,
+    private void runSync(ActivityStub acts, LenderConfig.Lender lender,
                          LenderConfig.Stage stage, LenderConfig.Step step) {
         StageActivity.CallRequest req = request(lender, stage, step, step.call, step.name);
-        StageActivity.CallResult res = acts.execute(req);
+        StageActivity.CallResult res = acts.execute(
+                activityName(stage, step.name), StageActivity.CallResult.class, req);
         ctx.putAll(res.extracted);
         history.add(new StepRecord(stage.name, step.name, "SUCCESS", 1,
                 "http " + res.httpStatus));
@@ -128,40 +145,124 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
      * The 4 parallel precheck calls. Two of them carry a condition, so the fan-out
      * width is decided by config at runtime, not by code.
      *
-     * Promise.allOf blocks the workflow, not a thread. The worker pod is free
-     * while these are in flight — contrast CompletableFuture.allOf holding a
-     * pod thread for the slowest bank endpoint.
+     * executeAsync blocks the workflow, not a thread. The worker pod is free while
+     * these are in flight — contrast CompletableFuture.allOf holding a pod thread
+     * for the slowest bank endpoint.
+     *
+     * The join is SETTLE-ALL, not fail-fast:
+     *   1. every launched branch is awaited, including branches still running when
+     *      a sibling has already failed. Promise.get() parks the workflow
+     *      coroutine, the branches keep running concurrently, so the wall clock is
+     *      still the slowest branch — not the sum;
+     *   2. each branch has exhausted its OWN retry policy before its promise
+     *      settles (per-call `retry` block, else lender.defaultRetry). A retryable
+     *      500 is retried with backoff inside the branch, invisible here;
+     *   3. every SUCCESSFUL branch's extract is merged into ctx in declared order,
+     *      so a partial fan-out is no longer discarded;
+     *   4. the go/no-go decision is taken once, after the join, from the collected
+     *      outcomes plus the config gate (`mandatory`, `minSuccess`,
+     *      `onBranchFailure`).
      */
-    private void runParallel(StageActivity acts, LenderConfig.Lender lender,
+    private void runParallel(ActivityStub defaultActs, LenderConfig.Lender lender,
                              LenderConfig.Stage stage, LenderConfig.Step step) {
+        List<LenderConfig.Call> launched = new ArrayList<>();
         List<Promise<StageActivity.CallResult>> promises = new ArrayList<>();
-        List<String> launched = new ArrayList<>();
 
         for (LenderConfig.Call call : step.calls) {
             if (!conditionHolds(call.condition)) {
+                ctx.put(branchKey(step, call.name), "SKIPPED");
                 history.add(new StepRecord(stage.name, step.name + "/" + call.name,
                         "SKIPPED", 0, "condition not met"));
                 continue;
             }
-            StageActivity.CallRequest req = request(lender, stage, step, call, call.name);
-            promises.add(Async.function(acts::execute, req));
-            launched.add(call.name);
+            // A branch with its own retry/timeout config gets its own stub; the
+            // rest share the lender-default stub built once by the caller.
+            ActivityStub acts = (call.retry == null && call.timeoutSeconds == null)
+                    ? defaultActs
+                    : Workflow.newUntypedActivityStub(activityOptions(lender, call));
+
+            promises.add(acts.executeAsync(activityName(stage, call.name),
+                    StageActivity.CallResult.class,
+                    request(lender, stage, step, call, call.name)));
+            launched.add(call);
         }
 
         if (promises.isEmpty()) {
+            ctx.put(decisionKey(step), "PROCEED");
             history.add(new StepRecord(stage.name, step.name, "SKIPPED", 0, "no branches enabled"));
             return;
         }
 
-        // Join. Any branch failure surfaces here after its own retry policy is exhausted.
-        Promise.allOf(promises).get();
+        // ---------------------------------------------------------- settle all
+        List<String> succeeded = new ArrayList<>();
+        List<String> failed = new ArrayList<>();
+        List<String> rejected = new ArrayList<>();
+        List<String> blocking = new ArrayList<>();
 
-        for (Promise<StageActivity.CallResult> p : promises) {
-            StageActivity.CallResult r = p.get();
-            ctx.putAll(r.extracted);
+        for (int i = 0; i < promises.size(); i++) {
+            LenderConfig.Call call = launched.get(i);
+            String status;
+            String detail;
+            try {
+                StageActivity.CallResult r = promises.get(i).get();
+                // Declared order, not completion order: the merge stays deterministic.
+                ctx.putAll(r.extracted);
+                status = "SUCCESS";
+                detail = "http " + r.httpStatus;
+                succeeded.add(call.name);
+            } catch (ActivityFailure af) {
+                boolean reject = isBusinessReject(af);
+                status = reject ? "REJECTED" : "FAILED";
+                detail = rootMessage(af);
+                (reject ? rejected : failed).add(call.name);
+                if (reject || call.mandatory) {
+                    blocking.add(call.name + "(" + status + ")");
+                }
+            }
+            ctx.put(branchKey(step, call.name), status);
+            history.add(new StepRecord(stage.name, step.name + "/" + call.name, status, 1, detail));
         }
-        history.add(new StepRecord(stage.name, step.name, "SUCCESS", promises.size(),
-                "parallel: " + String.join(", ", launched)));
+
+        // ------------------------------------------------------- decide, once
+        ctx.put(step.name + ".successCount", String.valueOf(succeeded.size()));
+        ctx.put(step.name + ".branchCount", String.valueOf(promises.size()));
+        ctx.put(step.name + ".failedCalls", String.join(",", failed));
+        ctx.put(step.name + ".rejectedCalls", String.join(",", rejected));
+
+        boolean quorumMet = step.minSuccess <= 0 || succeeded.size() >= step.minSuccess;
+        String summary = succeeded.size() + "/" + promises.size() + " ok"
+                + (blocking.isEmpty() ? "" : "; blocking: " + String.join(", ", blocking))
+                + (quorumMet ? "" : "; minSuccess=" + step.minSuccess + " not met");
+
+        if (!rejected.isEmpty()) {
+            // A decline is an answer, not a fault. No retry and no `mandatory:false`
+            // can change it, so it stops the flow whatever the gate says.
+            ctx.put(decisionKey(step), "STOP");
+            throw ApplicationFailure.newNonRetryableFailure(
+                    step.name + " rejected by lender: " + String.join(", ", rejected)
+                            + " [" + summary + "]",
+                    StageActivityImpl.BUSINESS_REJECT);
+        }
+
+        if (blocking.isEmpty() && quorumMet) {
+            ctx.put(decisionKey(step), failed.isEmpty() ? "PROCEED" : "PROCEED_DEGRADED");
+            history.add(new StepRecord(stage.name, step.name,
+                    failed.isEmpty() ? "SUCCESS" : "PARTIAL_SUCCESS", promises.size(),
+                    "parallel: " + summary
+                            + (failed.isEmpty() ? "" : "; tolerated: " + String.join(", ", failed))));
+            return;
+        }
+
+        if ("CONTINUE".equalsIgnoreCase(step.onBranchFailure)) {
+            ctx.put(decisionKey(step), "PROCEED_DEGRADED");
+            history.add(new StepRecord(stage.name, step.name, "PARTIAL_SUCCESS", promises.size(),
+                    "parallel: " + summary + "; onBranchFailure=CONTINUE"));
+            return;
+        }
+
+        ctx.put(decisionKey(step), "STOP");
+        throw ApplicationFailure.newNonRetryableFailure(
+                step.name + " gate not met: " + summary, StageActivityImpl.TECHNICAL_FAILURE);
     }
 
     /**
@@ -169,13 +270,14 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
      * no PendingCorrelation document, no poll_lock, no ASYNC_RESUME re-enqueue.
      * Workflow.sleep survives pod death, deploys and node drains.
      */
-    private void runPoll(StageActivity acts, LenderConfig.Lender lender,
+    private void runPoll(ActivityStub acts, LenderConfig.Lender lender,
                          LenderConfig.Stage stage, LenderConfig.Step step) {
         int attempt = 0;
         while (true) {
             attempt++;
             StageActivity.CallRequest req = request(lender, stage, step, step.call, step.name);
-            StageActivity.CallResult res = acts.execute(req);
+            StageActivity.CallResult res = acts.execute(
+                    activityName(stage, step.name), StageActivity.CallResult.class, req);
             ctx.putAll(res.extracted);
 
             if (res.terminal) {
@@ -288,20 +390,61 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                 call, lender.transport, snapshot);
     }
 
+    /**
+     * Activity type name shown in the Temporal UI timeline, e.g. "PRECHECK.panValidation".
+     * Stage prefix makes stage boundaries readable in the graph without opening events.
+     * Handled on the worker by DynamicStageActivityImpl.
+     */
+    private String activityName(LenderConfig.Stage stage, String callName) {
+        return stage.name + "." + callName;
+    }
+
     private ActivityOptions activityOptions(LenderConfig.Lender lender) {
-        LenderConfig.Retry r = lender.defaultRetry;
+        return activityOptions(lender, null);
+    }
+
+    /**
+     * Per-call override: a single fan-out branch can carry its own retry policy and
+     * timeout, e.g. a flaky NSDL endpoint retried 5 times while its siblings keep
+     * the lender default of 3.
+     */
+    private ActivityOptions activityOptions(LenderConfig.Lender lender, LenderConfig.Call call) {
+        LenderConfig.Retry r = (call != null && call.retry != null)
+                ? call.retry : lender.defaultRetry;
+        long timeoutSeconds = (call != null && call.timeoutSeconds != null)
+                ? call.timeoutSeconds : lender.transport.defaultTimeoutSeconds;
         return ActivityOptions.newBuilder()
-                .setStartToCloseTimeout(
-                        Duration.ofSeconds(lender.transport.defaultTimeoutSeconds + 10L))
+                .setStartToCloseTimeout(Duration.ofSeconds(timeoutSeconds + 10L))
                 .setRetryOptions(RetryOptions.newBuilder()
                         .setInitialInterval(Duration.ofSeconds(r.initialIntervalSeconds))
                         // > 1.0 matters: constant-interval retries during a bank
                         // outage burn Temporal Actions with nothing to show for it.
                         .setBackoffCoefficient(r.backoffCoefficient)
                         .setMaximumAttempts(r.maximumAttempts)
-                        .setDoNotRetry(r.nonRetryableErrorTypes.toArray(new String[0]))
+                        .setDoNotRetry(doNotRetry(lender, r))
                         .build())
                 .build();
+    }
+
+    /**
+     * A per-call retry block must not silently drop the lender-level non-retryable
+     * list, and BUSINESS_REJECT is never retryable whatever config says.
+     */
+    private String[] doNotRetry(LenderConfig.Lender lender, LenderConfig.Retry effective) {
+        Set<String> types = new LinkedHashSet<>(lender.defaultRetry.nonRetryableErrorTypes);
+        types.addAll(effective.nonRetryableErrorTypes);
+        types.add(StageActivityImpl.BUSINESS_REJECT);
+        return types.toArray(new String[0]);
+    }
+
+    /** ctx key carrying one fan-out branch verdict, e.g. "parallelChecks.panValidation.outcome". */
+    private String branchKey(LenderConfig.Step step, String callName) {
+        return step.name + "." + callName + ".outcome";
+    }
+
+    /** ctx key carrying the gate verdict: PROCEED | PROCEED_DEGRADED | STOP. */
+    private String decisionKey(LenderConfig.Step step) {
+        return step.name + ".decision";
     }
 
     private boolean conditionHolds(LenderConfig.Predicate p) {

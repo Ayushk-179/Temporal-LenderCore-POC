@@ -69,6 +69,16 @@ public class LenderConfig {
 
         // PARALLEL
         public List<Call> calls = new ArrayList<>();
+        /**
+         * What to do when the fan-out gate is not met (a mandatory branch failed,
+         * or minSuccess was not reached).
+         *   FAIL     — stop the flow (default; a lender rejection always stops it)
+         *   CONTINUE — go forward degraded; downstream steps branch on
+         *              ${step}.decision / ${step}.${call}.outcome via `condition`
+         */
+        public String onBranchFailure = "FAIL";
+        /** Quorum: minimum successful branches required to go forward. 0 = no quorum rule. */
+        public int minSuccess = 0;
 
         // POLL
         public int pollIntervalSeconds = 30;
@@ -87,6 +97,17 @@ public class LenderConfig {
         /** Only set for members of a PARALLEL group; otherwise the Step name is used. */
         public String name;
         public Predicate condition;
+
+        /**
+         * PARALLEL only. false = a technical failure on this branch (after its
+         * retries are exhausted) does not by itself stop the flow. A
+         * businessRejectWhen match still stops it — a lender "no" is an answer,
+         * not a fault.
+         */
+        public boolean mandatory = true;
+
+        /** Per-call retry override. Falls back to lender.defaultRetry when absent. */
+        public Retry retry;
 
         public String method = "POST";
         public String path;

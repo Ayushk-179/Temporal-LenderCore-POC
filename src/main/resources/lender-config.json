@@ -61,6 +61,8 @@
             {
               "name": "parallelChecks",
               "mode": "PARALLEL",
+              "onBranchFailure": "FAIL",
+              "minSuccess": 0,
               "calls": [
                 {
                   "name": "panValidation",
@@ -101,6 +103,8 @@
                 {
                   "name": "mobileAadhaarLink",
                   "condition": { "ctx": "aadhaarChecksNeeded", "op": "EQUALS", "value": "true" },
+                  "mandatory": false,
+                  "retry": { "initialIntervalSeconds": 1, "backoffCoefficient": 2.0, "maximumAttempts": 4, "nonRetryableErrorTypes": ["BUSINESS_REJECT"] },
                   "method": "POST",
                   "path": "/precheck/mobile-aadhaar",
                   "request": {

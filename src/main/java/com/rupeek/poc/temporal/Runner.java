@@ -1,6 +1,7 @@
 package com.rupeek.poc.temporal;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rupeek.poc.temporal.activity.DynamicStageActivityImpl;
 import com.rupeek.poc.temporal.activity.StageActivityImpl;
 import com.rupeek.poc.temporal.workflow.LenderFlowWorkflow;
 import com.rupeek.poc.temporal.workflow.LenderFlowWorkflowImpl;
@@ -67,7 +68,10 @@ public final class Runner {
         WorkerFactory factory = WorkerFactory.newInstance(client);
         Worker worker = factory.newWorker(taskQueue(slug));
         worker.registerWorkflowImplementationTypes(LenderFlowWorkflowImpl.class);
-        worker.registerActivitiesImplementations(new StageActivityImpl());
+        // Typed impl serves loadConfig; the dynamic dispatcher serves every
+        // config-named call type (PRECHECK.nameDobCheck, FUND_TRANSFER.disburse, ...).
+        worker.registerActivitiesImplementations(
+                new StageActivityImpl(), new DynamicStageActivityImpl());
         System.out.println("worker up on " + taskQueue(slug) + " — ctrl-C to kill it mid-flow");
         factory.start();
     }

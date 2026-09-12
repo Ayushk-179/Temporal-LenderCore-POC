@@ -13,7 +13,7 @@ Adding a lender is a config document, not a BPMN file plus 11 Java files.
 
 | Stage | Steps | Temporal primitive being demonstrated |
 |---|---|---|
-| PRECHECK | `nameDobCheck` → `dedupeCheck` → 4 parallel checks | `Async.function` + `Promise.allOf`, with 2 of the 4 branches conditionally skipped by config |
+| PRECHECK | `nameDobCheck` → `dedupeCheck` → 4 parallel checks | async fan-out with a settle-all join: every branch retries per config, successful branches merge their extracts, then one config-driven go/no-go gate. 2 of the 4 branches are conditionally skipped by config |
 | STP | `dedupe` → `customerCreation`* → `dedupeRetry`* → `customerInfo` → `accountInfo` → `loanStatus` | conditional steps, durable poll loop via `Workflow.sleep` |
 | FUND_TRANSFER | `eSignWait` → `pledgeCardSend` → `fundTransferStatus` | `Workflow.await` on a signal (days-long human wait), poll → park → manual-retry signal |
 

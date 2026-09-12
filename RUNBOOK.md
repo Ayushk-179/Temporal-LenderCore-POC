@@ -76,6 +76,12 @@ clock (one hour) and asserts in milliseconds.
 
 ---
 
+```bash
+pkill -f "com.rupeek.poc.temporal.Runner"   # workers
+pkill -f mock_lender.py                     # mock
+pkill -f "temporal server start-dev"        # server
+```
+
 ## 4. Full live demo — startup order
 
 Four processes. Each must be up before the next.
@@ -114,6 +120,11 @@ isolation story: separate queue, separate scaling, no new infra.
 
 ```bash
 R="mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="
+
+$R '-Dexec.args=start federal LR-1001'
+
+$R '-Dexec.args=signal LR-1001 pledgeCardReady'
+$R '-Dexec.args=status LR-1001'
 
 $R"start federal LR-1001"
 $R"status LR-1001"
@@ -184,26 +195,69 @@ curl "localhost:9099/_set?KEY=VALUE" # flip a knob (also resets counters)
 
 ### Parallel-branch failure semantics
 
-`Promise.allOf(...).get()` is **fail-fast**, and `ctx.putAll(...)` runs *after* it
-(`LenderFlowWorkflowImpl.java:171-176`). Consequences:
+The join is **settle-all**, not fail-fast (`LenderFlowWorkflowImpl.runParallel`).
+Every launched branch is awaited even after a sibling has already failed —
+`Promise.get()` parks the workflow coroutine, the branches keep running
+concurrently, so the step still costs the slowest branch, not the sum.
 
-- The first branch to fail aborts the whole step.
-- **No branch's `extract` values reach the context — not even from branches that
-  succeeded.** A partial fan-out yields nothing.
-- `failedAt` records `PRECHECK/parallelChecks` only; the failing branch name
-  appears in `reason`, not `failedAt`.
-- Sibling activities are not proactively cancelled; the workflow returns and the
-  server discards their results.
-- There is no "optional branch" / continue-on-failure option in config. Parallel
-  groups are all-or-nothing.
+Order of events inside one PARALLEL step:
+
+1. **Launch.** Branches whose `condition` fails are skipped and recorded as
+   `SKIPPED` before anything is scheduled.
+2. **Retry, per branch.** Each branch exhausts its own retry policy before its
+   promise settles — the call's `retry` block if present, else the lender's
+   `defaultRetry`. `BUSINESS_REJECT` is never retried, whatever config says.
+3. **Merge.** Every *successful* branch's `extract` is merged into ctx, in
+   declared order (deterministic on replay). A partial fan-out now contributes
+   its successful branches instead of contributing nothing.
+4. **Decide, once.** The gate below runs after every branch has settled.
+
+| Config | Where | Meaning |
+|---|---|---|
+| `mandatory` | call | `false` → a technical failure on this branch does not by itself stop the flow. Default `true`. |
+| `retry` | call | Per-branch retry override (`initialIntervalSeconds`, `backoffCoefficient`, `maximumAttempts`, `nonRetryableErrorTypes`). Falls back to `defaultRetry`. |
+| `minSuccess` | step | Quorum: minimum successful branches required. `0` = no quorum rule. |
+| `onBranchFailure` | step | `FAIL` (default) or `CONTINUE` when the gate is not met. |
+
+Gate precedence:
+
+1. **Any branch `REJECTED`** → outcome `REJECTED`, flow stops. A decline is an
+   answer, not a fault: neither `mandatory:false` nor `onBranchFailure:CONTINUE`
+   overrides it.
+2. **All mandatory branches OK and quorum met** → `PROCEED`, or
+   `PROCEED_DEGRADED` if a tolerated branch failed.
+3. **Gate not met** → `onBranchFailure`: `FAIL` gives outcome `FAILED`,
+   `CONTINUE` gives `PROCEED_DEGRADED`.
+
+Keys written into ctx, queryable and usable in any downstream step `condition`:
+
+| Key | Example |
+|---|---|
+| `<step>.<call>.outcome` | `parallelChecks.panValidation.outcome` = `SUCCESS` / `FAILED` / `REJECTED` / `SKIPPED` |
+| `<step>.decision` | `parallelChecks.decision` = `PROCEED` / `PROCEED_DEGRADED` / `STOP` |
+| `<step>.successCount`, `<step>.branchCount` | `3`, `4` |
+| `<step>.failedCalls`, `<step>.rejectedCalls` | `mobileAadhaarLink`, `` |
+
+`failedAt` still records `PRECHECK/parallelChecks`; the per-branch verdicts are
+in the history (`PRECHECK/parallelChecks/panValidation`) and in ctx.
+Sibling activities are not proactively cancelled — that is deliberate, since
+their results are now kept.
+
+In the shipped federal config, `mobileAadhaarLink` is `mandatory: false` with its
+own 4-attempt retry, so it is the branch to poke for a degraded run:
+
+```bash
+# Tolerated branch dies -> 4 attempts, then COMPLETED with decision PROCEED_DEGRADED
+curl "localhost:9099/_set?mobileAadhaarHttp=500"
+```
 
 | | Technical failure | Business rejection |
 |---|---|---|
 | Failure type | `TECHNICAL_FAILURE` | `BUSINESS_REJECT` |
-| Retries | 3 attempts, 2s → 4s backoff | **none** (non-retryable) |
+| Retries | per-call `retry`, else `defaultRetry` (3 attempts, 2s → 4s) | **none** (non-retryable) |
 | Time to fail | ~6s+ | immediate |
-| `outcome` | `FAILED` | `REJECTED` |
-| History | 3 × `ACTIVITY_TASK_STARTED` | 1 × `ACTIVITY_TASK_STARTED` |
+| Tolerable? | yes, via `mandatory:false` / `onBranchFailure:CONTINUE` | never |
+| `outcome` | `FAILED` (or flow continues, degraded) | `REJECTED` |
 
 ### The scenario matrix
 
@@ -419,6 +473,7 @@ Three tiers, and one inversion that explains most of the operational properties.
 │ YOUR JAR × N replicas   │      │ YOUR JAR × M replicas   │
 │  LenderFlowWorkflowImpl │      │  (identical code)       │
 │  StageActivityImpl      │      │                         │
+│  DynamicStageActivity…  │      │                         │
 └─────────────────────────┘      └─────────────────────────┘
 ```
 
@@ -449,7 +504,7 @@ Using `loanStatus` poll #1 (events 59–66 of an actual run):
 | 1 | Worker (workflow poller) | Picks up a Workflow Task, **replays `run()` from the top** against history, reaches the poll loop |
 | 2 | Worker | Returns **commands**, not results: `ScheduleActivityTask` |
 | 3 | History svc | Writes event 59 `ACTIVITY_TASK_SCHEDULED`, enqueues on the activity queue |
-| 4 | Worker (activity poller) | Runs `StageActivityImpl.execute()` — the **only** place a socket opens |
+| 4 | Worker (activity poller) | Activity type `STP.loanStatus` misses the typed map → `DynamicStageActivityImpl` → `StageActivityImpl.execute()` — the **only** place a socket opens (see §11.1) |
 | 5 | History svc | Events 60–61: started, completed with `{fedLoanStatus: PENDING, terminal: false}` |
 | 6 | Worker | New Workflow Task → replay → `terminal` false → `Workflow.sleep(10s)` → returns `StartTimer` |
 | 7 | History svc | Event 65 `TIMER_STARTED`; 10s later event 66 `TIMER_FIRED` |
@@ -604,3 +659,194 @@ stages carry image references.
 
 None are blockers. They are the three numbers a skeptical reviewer will probe:
 *what does one loan cost, and what stops it growing unbounded?*
+
+---
+
+## 11. Design decisions — the two a reviewer will push on
+
+Both of these are places where the POC deliberately picked one side of a
+tradeoff. Neither choice is obviously right; both need a different answer in
+production, and the reasoning is more useful than the verdict.
+
+### 11.1 UI naming — dynamic activity vs `setSummary`
+
+**The problem.** The Temporal UI labels every box in the timeline graph from
+`ActivityTaskScheduled.activityType.name`. With one generic `execute` method
+serving every configured call, a 14-step flow rendered as `LoadConfig` followed
+by thirteen identical `Execute` boxes. The config-driven design was invisible in
+the exact tool you use to demo it.
+
+**What the POC does — dynamic activity.** `Workflow.newUntypedActivityStub`
+(`:70`) takes the activity type as a *string argument* instead of deriving it
+from a Java method, so `activityName()` (`:300`) supplies it from config:
+
+```
+acts.execute("PRECHECK.nameDobCheck", CallResult.class, req)   // :122
+acts.executeAsync("PRECHECK.panValidation", ...)               // :150
+```
+
+That string lands verbatim in the scheduling command and therefore in history,
+so the graph now reads `PRECHECK.nameDobCheck`, `PRECHECK.panValidation`,
+`FUND_TRANSFER.disburse`. On the worker side,
+`registerActivitiesImplementations` builds a `Map<String, executor>` keyed by
+`@ActivityMethod` name with the first letter capitalised (`LoadConfig`,
+`Execute`). Dispatch per task:
+
+```
+task.activityType.name  ->  map lookup
+  hit   -> POJOActivityImplementation      (reflective typed call)
+  miss  -> DynamicActivityImplementation   (if registered)
+  miss  -> FAIL: Activity Type "X" is not registered with a worker
+```
+
+`DynamicStageActivityImpl` receives `EncodedValues` — a lazy wrapper over the
+raw payloads — deserializes arg 0 to a `CallRequest` via the DataConverter, and
+delegates to the single `StageActivityImpl.execute`. One HTTP executor, N names.
+`loadConfig` stays typed: one call, already meaningful, and typed keeps the
+`LenderConfig` return compile-checked.
+
+Two SDK constraints, confirmed in the 1.25.2 bytecode:
+
+- **Exactly one** `DynamicActivity` per worker —
+  *"An implementation of DynamicActivity is already registered with the worker"*.
+- The lookup miss is a real activity-task failure that **burns a retry attempt**,
+  not a no-op.
+
+**The alternative — `setSummary` (server/SDK 1.27+).** A `UserMetadata` message
+rides alongside the command rather than inside its identity fields:
+
+```
+ActivityTaskScheduled {
+  activityType  = { name: "Execute" }          <- UNCHANGED
+  user_metadata = { summary: "PRECHECK / parallelChecks / panValidation" }
+}
+```
+
+UI >= 2.34 labels the timeline from the summary. Same release adds
+`WorkflowOptions.setStaticSummary/setStaticDetails` (labels the row in the
+workflow *list*) and `Workflow.setCurrentDetails(markdown)`, which could be fed
+from `currentStage`/`currentStep` so the workflow page shows live progress with
+no query call. Note: summaries are Payloads, so a payload codec encrypts them
+too and the UI then needs a codec server to render them.
+
+**Prod verdict: typed activity + `setSummary`.** Three reasons, worst first.
+
+1. **Rolling-deploy safety.** Task queue dispatch is not type-aware — any worker
+   polling `lih-federal-work` can receive any activity task. Mid-rollout, an old
+   pod without `DynamicStageActivityImpl` picks up `PRECHECK.panValidation` and
+   fails it as unregistered, burning attempts against the configured
+   `maximumAttempts`. A slow rollout can fail real loans. A constant `Execute`
+   type is handled by every worker version and cannot hit this.
+2. **A config rename becomes replay-breaking.** Activity type is part of the
+   command the SDK compares on replay. Rename a call in config and in-flight runs
+   that scheduled the old name hit a non-determinism error. With 30 lenders,
+   week-long e-sign waits, and config owned by whoever owns the integration,
+   someone eventually renames a JSON field and takes down live loans. A summary
+   is metadata; renames are cosmetic.
+3. **Metric cardinality.** The worker tags `temporal_activity_execution_latency`,
+   `temporal_activity_schedule_to_start_latency`,
+   `temporal_activity_execution_failed` and friends with `activity_type`.
+   Dynamic naming gives ~30 lenders x ~15 calls = ~450 types x ~8 metrics x
+   histogram buckets — survivable, but it grows *whenever someone edits config*
+   and per-type alert rules silently miss the new names.
+
+Mitigating factor for the current code: `activityName` is
+`stage.name + "." + callName` — config-derived, **no per-instance data**. That
+keeps the set bounded. The fatal version of this pattern puts `loanRequestId` or
+similar in the type name; do not let anyone "improve" it that way.
+
+**Dynamic is still correct when** you are below server 1.27 with no upgrade
+scheduled — which is where this POC sits, and where the demo value of a
+self-documenting timeline outweighs the three risks above.
+
+**The prod shape:**
+
+```java
+ActivityOptions.newBuilder(base)
+    .setSummary(stage.name + "/" + step.name + "/" + callName)   // UI label
+    // attempt suffix required — activity IDs must be unique within a workflow
+    .setActivityId(stage.name + "/" + callName + "#" + attempt)
+    .build();
+```
+
+plus one custom metric emitted from inside `StageActivityImpl` with a curated
+label set (`lender`, `call`, `outcome`) — so you own the cardinality budget
+instead of inheriting it from config edits.
+
+### 11.2 Config snapshot — loaded once per execution
+
+**Correcting a comment in the code.** `StageActivity.loadConfig`'s javadoc says
+config is loaded once "so a replay months later uses the SAME config". Replay
+safety does not come from loading once — it comes from config being read **inside
+an activity**. Activity results are recorded in history and never re-executed on
+replay; ten `loadConfig` calls would each replay their own recorded bytes.
+Determinism holds either way.
+
+What loading once at `:65` actually buys is **semantic coherence**: one loan
+follows exactly one version of the flow, start to finish. That is a business
+decision, not a determinism constraint. The hard invariant underneath: **config
+can only affect a workflow's future, never its past.**
+
+**Where the snapshot hurts.**
+
+- *Endpoint rotation while loans are parked.* Loan parked on `eSignWait` for
+  days. Lender moves `/v1/loan-status` -> `/v2/loan-status`; config is fixed.
+  The loan resumes, calls v1, 404s, exhausts retries, `FAILED` — and so does
+  every other in-flight loan. Fleet-wide manual remediation from a change that
+  should have been a non-event.
+- *Timeout tuning cannot reach live flows.* Bump
+  `transport.defaultTimeoutSeconds` and in-flight loans ignore it: the stub from
+  `activityOptions(lender)` (`:304`) is built once, so `startToClose` **and** the
+  retry policy are frozen at start. This is the most common real "change a
+  running workflow" request and it is pure knob-turning with no shape risk.
+
+**Where the snapshot saves you.**
+
+- *A config edit breaks a data dependency mid-flight.* Insert `panVerify` before
+  `pledgeCardSend` and make the latter use `${ctx.panRefId}`. A loan already past
+  PRECHECK reloads at the FUND_TRANSFER boundary and renders an unresolved
+  template into a money-moving call. `ctx` is a flat accumulator with no schema
+  check; nothing in the code catches this.
+- *A rename becomes a double disbursal.* Rename step `disburse` -> `fundTransfer`.
+  Cosmetic — except `_requestId` and the `history` records key off step names,
+  and so does anything the lender dedupes on. A loan that already disbursed under
+  the old name no longer matches. Renaming a JSON field is not obviously a code
+  change; that is precisely what makes it dangerous.
+- *Audit.* "What flow did loan X follow?" is one activity result at the top of
+  history. Per-stage reload means stitching N reads and hoping each recorded a
+  version.
+- *New failure surface.* Every reload point is a dependency on the config store.
+  It retries, so nothing corrupts — but an outage stalls flows at every stage
+  boundary and burns actions.
+
+**Recommendation — two tiers, which the schema almost already has.**
+
+| tier | fields | lifetime |
+|---|---|---|
+| flow **shape** | `lender.stages` — order, conditions, extraction, step names | pinned at start |
+| operational **knobs** | `lender.transport`, `lender.defaultRetry` — base URL, headers, timeouts, retry, poll interval | re-read per stage, stub rebuilt |
+
+That split kills both "where it hurts" cases without opening either "where it
+saves you" case. Cheap to implement because `LenderConfig` already separates
+`transport`/`defaultRetry` from `stages`: add a `loadTransport(lenderSlug)`
+activity called at each stage boundary and move stub construction inside the
+stage loop.
+
+Then add an **explicit escape hatch** for the rare shape change — an
+`@UpdateMethod adoptConfigVersion(String version)` that swaps the pinned config
+for remaining steps only. Properties that matter: an operator opts in per
+workflow, it is recorded in history so the audit trail shows where the version
+switched, and nobody triggers it by saving a file. Have it reject the update
+unless every `${ctx.*}` referenced by the *remaining* steps already resolves —
+that check is what stops the data-dependency scenario above.
+
+**For a loan already on the wrong path, the tool is not config — it is Reset.**
+Reset to an event before `loadConfig`; activities re-execute from there, so the
+reset run picks up current config. Do not build reload semantics to approximate
+this.
+
+**If flows run for days, revisit Continue-As-New at stage boundaries.** You get a
+fresh config snapshot per stage *and* bounded history (see limit #2 above), with
+the version switch visible as a run boundary instead of buried mid-history.
+Bigger change — `ctx` and `history` become carry-over input — but it is the shape
+this converges on.

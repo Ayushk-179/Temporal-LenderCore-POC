@@ -1,5 +1,6 @@
 package com.rupeek.poc.temporal;
 
+import com.rupeek.poc.temporal.activity.DynamicStageActivityImpl;
 import com.rupeek.poc.temporal.activity.StageActivity;
 import com.rupeek.poc.temporal.activity.StageActivityImpl;
 import com.rupeek.poc.temporal.config.LenderConfig;
@@ -18,6 +19,7 @@ import java.io.InputStream;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,15 +66,29 @@ class LenderFlowWorkflowTest {
         int sanctionTerminalAfter = 3;
         String panStatusCode = "E";
 
+        /** callName -> how many attempts fail with a RETRYABLE technical failure. */
+        final Map<String, Integer> failAttempts = new LinkedHashMap<>();
+        /** callName -> attempts actually served, so tests can assert retry counts. */
+        final Map<String, AtomicInteger> attempts = new LinkedHashMap<>();
+        /** Lets a test flip config knobs (mandatory / onBranchFailure / minSuccess). */
+        Consumer<LenderConfig> configTweak = c -> { };
+
         @Override
         public LenderConfig loadConfig() {
             try (InputStream in = getClass().getClassLoader()
                     .getResourceAsStream("lender-config.json")) {
-                return new com.fasterxml.jackson.databind.ObjectMapper()
+                LenderConfig cfg = new com.fasterxml.jackson.databind.ObjectMapper()
                         .readValue(in, LenderConfig.class);
+                configTweak.accept(cfg);
+                return cfg;
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
+        }
+
+        int attemptsFor(String callName) {
+            AtomicInteger a = attempts.get(callName);
+            return a == null ? 0 : a.get();
         }
 
         @Override
@@ -81,6 +97,14 @@ class LenderFlowWorkflowTest {
             CallResult r = new CallResult();
             r.callName = name;
             r.httpStatus = 200;
+
+            int attempt = attempts.computeIfAbsent(name, k -> new AtomicInteger())
+                    .incrementAndGet();
+            Integer failFirst = failAttempts.get(name);
+            if (failFirst != null && (failFirst < 0 || attempt <= failFirst)) {
+                throw ApplicationFailure.newFailure(name + " upstream 500",
+                        StageActivityImpl.TECHNICAL_FAILURE);
+            }
 
             switch (name) {
                 case "panValidation":
@@ -158,7 +182,7 @@ class LenderFlowWorkflowTest {
     @Test
     void happyPath_allThreeStages_withTimeSkippedPollsAndEsignSignal() {
         FakeStageActivity acts = new FakeStageActivity();
-        worker.registerActivitiesImplementations(acts);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-HAPPY-1");
@@ -181,7 +205,7 @@ class LenderFlowWorkflowTest {
     void businessRejection_isNotRetried_andSurfacesAsRejected() {
         FakeStageActivity acts = new FakeStageActivity();
         acts.panStatusCode = "F";           // fake PAN -> lender says no
-        worker.registerActivitiesImplementations(acts);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-REJECT-1");
@@ -190,13 +214,128 @@ class LenderFlowWorkflowTest {
 
         assertEquals("REJECTED", result.outcome);
         assertTrue(result.failedAt.startsWith("PRECHECK/parallelChecks"));
+        // Settle-all: the siblings still ran and were still recorded, even though
+        // panValidation had already come back with a decline.
+        assertEquals("SUCCESS", result.finalContext.get("parallelChecks.unNameCheck.outcome"));
+        assertEquals("STOP", result.finalContext.get("parallelChecks.decision"));
+        assertEquals("panValidation", result.finalContext.get("parallelChecks.rejectedCalls"));
+    }
+
+    // -------------------------------------------------- parallel join semantics
+
+    @Test
+    void parallelBranchFailure_keepsSuccessfulSiblingResults_thenStopsAtTheGate() {
+        FakeStageActivity acts = new FakeStageActivity();
+        acts.failAttempts.put("panValidation", -1);   // never recovers
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-PARTIAL-1");
+        LenderFlowWorkflow.FlowResult result = wf.run(
+                new LenderFlowWorkflow.FlowInput("federal", "LR-PARTIAL-1", seed()));
+
+        assertEquals("FAILED", result.outcome);
+        assertEquals("PRECHECK/parallelChecks", result.failedAt);
+
+        // The whole point: a mandatory branch died, and the three that succeeded
+        // still contributed their extracts instead of being thrown away.
+        assertEquals("SUCCESS", result.finalContext.get("unNameCheckStatus"));
+        assertEquals("SUCCESS", result.finalContext.get("panAadhaarLinkStatus"));
+        assertEquals("FAILED", result.finalContext.get("parallelChecks.panValidation.outcome"));
+        assertEquals("3", result.finalContext.get("parallelChecks.successCount"));
+        assertEquals("STOP", result.finalContext.get("parallelChecks.decision"));
+
+        // Every branch was awaited, not abandoned when the first one failed.
+        assertTrue(acts.attemptsFor("mobileAadhaarLink") >= 1);
+        // ...and the dead branch burned its configured retries first.
+        assertEquals(3, acts.attemptsFor("panValidation"));   // lender defaultRetry
+    }
+
+    @Test
+    void retryableBranchFailure_isRetriedPerConfig_thenFlowGoesForward() {
+        FakeStageActivity acts = new FakeStageActivity();
+        acts.failAttempts.put("unNameCheck", 2);     // 2 x 500, succeeds on attempt 3
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-RETRY-1");
+        WorkflowClient.start(wf::run,
+                new LenderFlowWorkflow.FlowInput("federal", "LR-RETRY-1", seed()));
+        wf.pledgeCardReady(Map.of());
+        LenderFlowWorkflow.FlowResult result = wf.run(
+                new LenderFlowWorkflow.FlowInput("federal", "LR-RETRY-1", seed()));
+
+        assertEquals("COMPLETED", result.outcome);
+        assertEquals(3, acts.attemptsFor("unNameCheck"));
+        assertEquals("PROCEED", result.finalContext.get("parallelChecks.decision"));
+    }
+
+    @Test
+    void optionalBranchFailure_isTolerated_andFlowProceedsDegraded() {
+        FakeStageActivity acts = new FakeStageActivity();
+        // mobileAadhaarLink is mandatory:false in config, with its own 4-attempt retry.
+        acts.failAttempts.put("mobileAadhaarLink", -1);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-DEGRADED-1");
+        WorkflowClient.start(wf::run,
+                new LenderFlowWorkflow.FlowInput("federal", "LR-DEGRADED-1", seed()));
+        wf.pledgeCardReady(Map.of());
+        LenderFlowWorkflow.FlowResult result = wf.run(
+                new LenderFlowWorkflow.FlowInput("federal", "LR-DEGRADED-1", seed()));
+
+        assertEquals("COMPLETED", result.outcome);
+        assertEquals("PROCEED_DEGRADED", result.finalContext.get("parallelChecks.decision"));
+        assertEquals("mobileAadhaarLink", result.finalContext.get("parallelChecks.failedCalls"));
+        assertEquals(4, acts.attemptsFor("mobileAadhaarLink"));   // per-call retry override
+    }
+
+    @Test
+    void mandatoryBranchFailure_isTolerated_whenGateSaysCONTINUE() {
+        FakeStageActivity acts = new FakeStageActivity();
+        acts.failAttempts.put("panAadhaarLink", -1);
+        acts.configTweak = cfg -> cfg.lender("federal").stages.get(0).steps.stream()
+                .filter(st -> "parallelChecks".equals(st.name))
+                .forEach(st -> st.onBranchFailure = "CONTINUE");
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-CONTINUE-1");
+        WorkflowClient.start(wf::run,
+                new LenderFlowWorkflow.FlowInput("federal", "LR-CONTINUE-1", seed()));
+        wf.pledgeCardReady(Map.of());
+        LenderFlowWorkflow.FlowResult result = wf.run(
+                new LenderFlowWorkflow.FlowInput("federal", "LR-CONTINUE-1", seed()));
+
+        assertEquals("COMPLETED", result.outcome);
+        assertEquals("PROCEED_DEGRADED", result.finalContext.get("parallelChecks.decision"));
+    }
+
+    @Test
+    void quorum_stopsTheFlow_whenTooFewBranchesSucceed() {
+        FakeStageActivity acts = new FakeStageActivity();
+        acts.failAttempts.put("mobileAadhaarLink", -1);   // optional, but still not a success
+        acts.configTweak = cfg -> cfg.lender("federal").stages.get(0).steps.stream()
+                .filter(st -> "parallelChecks".equals(st.name))
+                .forEach(st -> st.minSuccess = 4);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-QUORUM-1");
+        LenderFlowWorkflow.FlowResult result = wf.run(
+                new LenderFlowWorkflow.FlowInput("federal", "LR-QUORUM-1", seed()));
+
+        assertEquals("FAILED", result.outcome);
+        assertEquals("STOP", result.finalContext.get("parallelChecks.decision"));
+        assertTrue(result.reason.contains("minSuccess=4"));
     }
 
     @Test
     void customerCreation_isSkipped_whenDedupeFlagIsY() {
         FakeStageActivity acts = new FakeStageActivity();
         acts.scripted.put("dedupeFlag", "Y");
-        worker.registerActivitiesImplementations(acts);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-SKIP-1");
@@ -214,7 +353,7 @@ class LenderFlowWorkflowTest {
     void aadhaarChecks_areSkipped_whenDedupeSaysNotNeeded() {
         FakeStageActivity acts = new FakeStageActivity();
         acts.scripted.put("aadhaarChecksNeeded", "false");
-        worker.registerActivitiesImplementations(acts);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-AADHAAR-1");
@@ -232,7 +371,7 @@ class LenderFlowWorkflowTest {
     void loanStatusPoll_exhausts_thenParksForManualRetrySignal() {
         FakeStageActivity acts = new FakeStageActivity();
         acts.loanStatusTerminalAfter = 45;   // never terminal within maxAttempts=30
-        worker.registerActivitiesImplementations(acts);
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-EXHAUST-1");
@@ -258,8 +397,8 @@ class LenderFlowWorkflowTest {
         FakeStageActivity acts = new FakeStageActivity();
         Worker demoWorker = env.newWorker("lih-demobank-work");
         demoWorker.registerWorkflowImplementationTypes(LenderFlowWorkflowImpl.class);
-        demoWorker.registerActivitiesImplementations(acts);
-        worker.registerActivitiesImplementations(acts);
+        demoWorker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
+        worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         env.start();
 
         LenderFlowWorkflow wf = client.newWorkflowStub(LenderFlowWorkflow.class,
