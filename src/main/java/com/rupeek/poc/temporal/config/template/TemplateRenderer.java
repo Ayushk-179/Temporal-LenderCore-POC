@@ -142,9 +142,9 @@ public final class TemplateRenderer {
             head = head.substring(colon + 1).trim();
         }
 
-        String value = lookup(head, ctx);
+        String value = lookup(head, ctx, true, expression);
         if (value == null && fallback != null) {
-            value = lookup(fallback, ctx);
+            value = lookup(fallback, ctx, false, expression);
         }
         if (value == null) {
             if (strict) {
@@ -161,14 +161,31 @@ public final class TemplateRenderer {
         return coerce(type, value, expression);
     }
 
-    /** "ctx.key" reads context; anything else is a literal (quoted or bare). */
-    private static String lookup(String ref, Map<String, String> ctx) {
+    /**
+     * "ctx.key" reads context; a quoted "literal" is itself.
+     *
+     * In HEAD position a bare token is REJECTED. Without that rule a typo —
+     * ${cts.pan} instead of ${ctx.pan} — would quietly resolve to the literal
+     * string "cts.pan" and ship it to the lender in the payload. That is the same
+     * class of silent-wrong-value bug as the old getOrDefault(key, ""), so it gets
+     * the same treatment: fail loudly and name the fix.
+     *
+     * In FALLBACK position (after ?:) a bare token IS a literal, which is what
+     * makes ${num:ctx.loanAmount ?: 150000} read naturally.
+     */
+    private static String lookup(String ref, Map<String, String> ctx,
+                                 boolean headPosition, String expression) {
         if (ref.startsWith("ctx.")) {
             String v = ctx.get(ref.substring(4));
             return v == null || v.isBlank() ? null : v;
         }
         if (ref.length() >= 2 && ref.startsWith("\"") && ref.endsWith("\"")) {
             return ref.substring(1, ref.length() - 1);
+        }
+        if (headPosition) {
+            throw new UnresolvedTemplateException("'" + ref + "' in ${" + expression
+                    + "} is not a context reference. Use ${ctx." + ref
+                    + "} to read context, or \"" + ref + "\" (quoted) for a literal.");
         }
         return ref.isBlank() ? null : ref;
     }

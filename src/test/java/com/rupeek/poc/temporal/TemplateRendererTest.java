@@ -104,6 +104,33 @@ class TemplateRendererTest {
                 TemplateRenderer.renderString("/loan/${ctx.loanAmount}/status", ctx(), true));
     }
 
+    /**
+     * A typo'd context reference used to resolve to the LITERAL STRING "cts.pan"
+     * and ship it to the lender. Same class of silent-wrong-value bug as the old
+     * getOrDefault(key, ""), so it gets the same treatment.
+     */
+    @Test
+    void typoedContextReference_isRejected_notSentAsALiteral() {
+        UnresolvedTemplateException e = assertThrows(UnresolvedTemplateException.class,
+                () -> TemplateRenderer.renderString("${cts.pan}", ctx(), true));
+        assertTrue(e.getMessage().contains("is not a context reference"));
+        assertTrue(e.getMessage().contains("${ctx.cts.pan}"));
+    }
+
+    /** A quoted literal in head position is still a literal — that stays legal. */
+    @Test
+    void quotedLiteralInHeadPosition_isStillAllowed() {
+        assertEquals("SELF", TemplateRenderer.renderString("${\"SELF\"}", ctx(), true));
+    }
+
+    /** A bare token AFTER ?: is a literal — that is what makes defaults read naturally. */
+    @Test
+    void bareTokenAfterDefaultOperator_isStillALiteral() throws Exception {
+        JsonNode out = TemplateRenderer.render(
+                tmpl("{\"amount\":\"${num:ctx.missing ?: 150000}\"}"), ctx(), true);
+        assertEquals(150000, out.get("amount").asInt());
+    }
+
     @Test
     void unknownFunction_isRejected_ratherThanIgnored() {
         assertThrows(UnresolvedTemplateException.class,

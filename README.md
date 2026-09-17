@@ -4,11 +4,14 @@ One generic workflow. All lender specifics live in an **external config store**,
 not in the jar. Adding a lender is a config document, not a BPMN file plus 11 Java
 files — and changing one does not need a redeploy.
 
+**[RUNBOOK.md](RUNBOOK.md)** is the operational guide: how to run it, 13 numbered
+test scenarios with copy-paste commands, and a one-command reset between them.
+
 See **[CONFIG-DESIGN.md](CONFIG-DESIGN.md)** for the config architecture: the
 skeleton/binding split, why it is replay-safe, how the store is normalised per
 stage, and the list of production concerns this POC deliberately leaves unbuilt.
 
-> **Builds and runs.** `mvn test` is green (25 tests), and the full flow plus the
+> **Builds and runs.** `mvn test` is green (41 tests), and the full flow plus the
 > live hot-config-edit demo have been run end to end against `temporal server
 > start-dev` and the local mock. The design is still the deliverable — see
 > [CONFIG-DESIGN.md §7](CONFIG-DESIGN.md#7-what-was-not-built-and-why) for what a
@@ -55,8 +58,14 @@ mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="statu
 # 6. Release the e-sign wait (this is what PUT /v1/disbursement becomes)
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
 
+# 7a. Write a value into a RUNNING loan that config cannot reach
+mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="patch LR-1001 branchCode=BLR-042"
+
 # 7. Un-stick a step that parked after a bad config change (no redeploy)
 mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
+
+# 8. Put config + mock + Temporal back to scenario zero (run after every scenario)
+mvn exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
 
 # Tests — the 1-hour poll loop runs in milliseconds
 mvn test

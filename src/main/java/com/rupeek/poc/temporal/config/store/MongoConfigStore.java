@@ -11,6 +11,8 @@ import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.Sorts;
 import org.bson.Document;
 import org.bson.conversions.Bson;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -36,6 +38,7 @@ import java.util.regex.Pattern;
 public class MongoConfigStore implements ConfigStore {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(MongoConfigStore.class);
 
     private final MongoClient client;
     private final MongoDatabase db;
@@ -56,6 +59,7 @@ public class MongoConfigStore implements ConfigStore {
     @Override
     public JsonNode read(String collection, String id) {
         Document d = col(collection).find(Filters.eq("_id", id)).first();
+        log.debug("read {}/{} -> {}", collection, id, d == null ? "MISSING" : "ok");
         return d == null ? null : toJson(d);
     }
 
@@ -80,6 +84,15 @@ public class MongoConfigStore implements ConfigStore {
             throw new IllegalStateException(
                     "Cannot write " + collection + "/" + id + ": " + e.getMessage(), e);
         }
+    }
+
+    @Override
+    public void clear() {
+        for (String c : new String[]{LENDERS, POINTERS, FLOWS, STAGES, BINDINGS,
+                TRANSPORTS, STAGE_KNOBS}) {
+            col(c).drop();
+        }
+        log.debug("dropped all config collections in {}", dbName);
     }
 
     @Override

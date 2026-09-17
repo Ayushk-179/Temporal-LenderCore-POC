@@ -14,7 +14,10 @@ import com.rupeek.poc.temporal.config.store.ConfigStores;
 import com.rupeek.poc.temporal.config.template.JsonPaths;
 import com.rupeek.poc.temporal.config.template.TemplateRenderer;
 import com.rupeek.poc.temporal.config.template.UnresolvedTemplateException;
+import io.temporal.activity.Activity;
 import io.temporal.failure.ApplicationFailure;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.URLEncoder;
@@ -49,6 +52,19 @@ public class StageActivityImpl implements StageActivity {
     public static final String CONFIG_ERROR = "CONFIG_ERROR";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(StageActivityImpl.class);
+
+    /**
+     * POC default: log full request and response bodies. Those bodies carry PAN,
+     * Aadhaar reference and mobile — set LOG_RAW=false to suppress them, and treat
+     * raw-body logging as something that must NOT ship (see CONFIG-DESIGN.md §7.16).
+     *
+     * An activity is ordinary code, not workflow code, so a plain slf4j logger is
+     * correct here — activities do not replay.
+     */
+    private static final boolean LOG_RAW =
+            !"false".equalsIgnoreCase(String.valueOf(envOrProp("LOG_RAW", "true")));
+    private static final int RAW_CAP = 2000;
 
     private final ConfigResolver config;
 
@@ -67,7 +83,10 @@ public class StageActivityImpl implements StageActivity {
     @Override
     public FlowSkeleton loadFlowSkeleton(String lenderSlug) {
         try {
-            return config.skeleton(lenderSlug);
+            FlowSkeleton skeleton = config.skeleton(lenderSlug);
+            log.info("CONFIG loadFlowSkeleton lender={} version={} stages={}",
+                    lenderSlug, skeleton.version, skeleton.stages.size());
+            return skeleton;
         } catch (ConfigResolver.ConfigMissingException e) {
             throw ApplicationFailure.newNonRetryableFailure(e.getMessage(), CONFIG_ERROR);
         } catch (Exception e) {
@@ -79,7 +98,13 @@ public class StageActivityImpl implements StageActivity {
     @Override
     public StageKnobs loadStageKnobs(String lenderSlug, String stageName) {
         try {
-            return config.knobs(lenderSlug, stageName);
+            StageKnobs knobs = config.knobs(lenderSlug, stageName);
+            log.info("CONFIG loadStageKnobs lender={} stage={} transport={} "
+                            + "retry={}x timeout={}s overrides={}",
+                    lenderSlug, stageName, knobs.transportVersion,
+                    knobs.retry.maximumAttempts, knobs.timeoutSeconds,
+                    knobs.callOverrides.size());
+            return knobs;
         } catch (ConfigResolver.ConfigMissingException e) {
             throw ApplicationFailure.newNonRetryableFailure(e.getMessage(), CONFIG_ERROR);
         } catch (Exception e) {
@@ -90,16 +115,24 @@ public class StageActivityImpl implements StageActivity {
 
     @Override
     public CallResult execute(CallRequest req) {
+        // For SYNC/POLL the callName IS the step name; don't print it twice.
         String label = req.stageName + "/" + req.stepName
-                + (req.callName == null ? "" : "/" + req.callName);
+                + (req.callName == null || req.callName.equals(req.stepName)
+                        ? "" : "/" + req.callName);
+        int attempt = currentAttempt();
 
         // ---- resolution point: EVERY attempt reads the store as it is right now
         ResolvedBinding resolved;
         try {
             resolved = config.binding(req.lenderSlug, req.callKey);
         } catch (ConfigResolver.ConfigMissingException e) {
+            log.error("[{}] attempt {} CONFIG MISSING for callKey={} — {}",
+                    label, attempt, req.callKey, e.getMessage());
             throw ApplicationFailure.newFailure(label + " " + e.getMessage(), CONFIG_ERROR);
         }
+        log.info("[{}] attempt {} RESOLVED callKey={} binding={} transport={} "
+                        + "(re-read from the store on THIS attempt)",
+                label, attempt, req.callKey, resolved.bindingVersion, resolved.transportVersion);
 
         CallBinding call = resolved.binding;
         Transport transport = resolved.transport;
@@ -121,10 +154,19 @@ public class StageActivityImpl implements StageActivity {
                 b.header(h.getKey(), TemplateRenderer.renderString(h.getValue(), req.context, true));
             }
         } catch (UnresolvedTemplateException e) {
-            // Retryable on purpose — see CONFIG_ERROR above.
+            // Retryable on purpose — see CONFIG_ERROR above. The retry ladder is
+            // the window in which an operator can fix the template.
+            log.error("[{}] attempt {} TEMPLATE ERROR [binding {}] {} | ctx keys available: {}",
+                    label, attempt, resolved.bindingVersion, e.getMessage(), req.context.keySet());
             throw ApplicationFailure.newFailure(
                     label + " [binding " + resolved.bindingVersion + "] " + e.getMessage(),
                     CONFIG_ERROR);
+        }
+
+        log.info("[{}] attempt {} --> {} {}", label, attempt, call.method, url);
+        if (LOG_RAW) {
+            log.info("[{}] --> headers {}", label, headersFor(transport, call, req.context));
+            log.info("[{}] --> body {}", label, cap(body));
         }
 
         if ("GET".equalsIgnoreCase(call.method)) {
@@ -138,21 +180,32 @@ public class StageActivityImpl implements StageActivity {
             resp = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
         } catch (Exception e) {
             // Transient — let Temporal's retry policy handle it.
+            log.error("[{}] attempt {} TRANSPORT ERROR to {} — {}",
+                    label, attempt, url, e.getMessage());
             throw ApplicationFailure.newFailure(
                     label + " transport error to " + url + ": " + e.getMessage(),
                     TECHNICAL_FAILURE);
         }
 
+        log.info("[{}] attempt {} <-- HTTP {}", label, attempt, resp.statusCode());
+        if (LOG_RAW) {
+            log.info("[{}] <-- body {}", label, cap(resp.body()));
+        }
+
         JsonNode json = parse(resp.body(), label);
 
-        if (matches(call.businessRejectWhen, json, req.context)) {
+        if (matches("businessRejectWhen", call.businessRejectWhen, json, req.context, label)) {
             // Non-retryable: the lender said no. No retry and no config edit can
             // change the answer, so this must never park either.
+            log.warn("[{}] attempt {} BUSINESS REJECT — lender declined; no retry, no park",
+                    label, attempt);
             throw ApplicationFailure.newNonRetryableFailure(
                     label + " rejected by lender", BUSINESS_REJECT, resp.body());
         }
 
         if (resp.statusCode() >= 500) {
+            log.warn("[{}] attempt {} HTTP {} — retryable technical failure",
+                    label, attempt, resp.statusCode());
             throw ApplicationFailure.newFailure(
                     label + " HTTP " + resp.statusCode(), TECHNICAL_FAILURE);
         }
@@ -162,11 +215,16 @@ public class StageActivityImpl implements StageActivity {
         out.httpStatus = resp.statusCode();
         out.rawResponseSnippet = snippet(resp.body());
         out.extracted = extract(call.extract, json, label);
-        out.terminal = call.terminalWhen != null && matches(call.terminalWhen, json, req.context);
+        out.terminal = matches("terminalWhen", call.terminalWhen, json, req.context, label);
         out.bindingVersion = resolved.bindingVersion;
         out.transportVersion = resolved.transportVersion;
+        log.info("[{}] attempt {} EXTRACTED {} (terminal={})",
+                label, attempt, out.extracted, out.terminal);
 
-        if (call.successWhen != null && !matches(call.successWhen, json, req.context)) {
+        if (call.successWhen != null
+                && !matches("successWhen", call.successWhen, json, req.context, label)) {
+            log.warn("[{}] attempt {} SUCCESS CHECK FAILED — treating as retryable",
+                    label, attempt);
             throw ApplicationFailure.newFailure(
                     label + " successWhen not satisfied (HTTP " + resp.statusCode()
                             + ", binding " + resolved.bindingVersion + "): " + snippet(resp.body()),
@@ -239,12 +297,64 @@ public class StageActivityImpl implements StageActivity {
         return out;
     }
 
-    private boolean matches(Predicate p, JsonNode json, Map<String, String> ctx) {
+    /**
+     * Every binding predicate is logged with the value it actually saw. "Why did
+     * this call fail successWhen" is the single most common config question, and
+     * it should be answerable from the log without re-running anything.
+     */
+    private boolean matches(String name, Predicate p, JsonNode json,
+                            Map<String, String> ctx, String label) {
         if (p == null) {
             return false;
         }
+        String source = p.path != null ? p.path : "ctx." + p.ctx;
         String actual = p.path != null ? JsonPaths.extract(json, p.path) : ctx.get(p.ctx);
-        return Predicates.evaluate(p, actual);
+        String op = p.op == null ? "EQUALS" : p.op.toUpperCase();
+        boolean result;
+        try {
+            result = Predicates.evaluate(p, actual);
+        } catch (IllegalArgumentException e) {
+            log.error("[{}] {} has an unknown op '{}'", label, name, p.op);
+            throw ApplicationFailure.newNonRetryableFailure(
+                    label + " " + name + ": " + e.getMessage(), CONFIG_ERROR);
+        }
+        log.info("[{}]   {}: {} {} {} | actual={} -> {}", label, name, source, op,
+                "BLANK".equals(op) || "NOT_BLANK".equals(op)
+                        ? "" : (p.values != null && !p.values.isEmpty() ? p.values : p.value),
+                actual, result);
+        return result;
+    }
+
+    /** Rendered headers, for the request log. Static + per-call, same as sent. */
+    private Map<String, String> headersFor(Transport transport, CallBinding call,
+                                           Map<String, String> ctx) {
+        Map<String, String> all = new LinkedHashMap<>(transport.staticHeaders);
+        call.headers.forEach((k, v) -> all.put(k, TemplateRenderer.renderString(v, ctx, false)));
+        return all;
+    }
+
+    private static String cap(String s) {
+        if (s == null || s.isEmpty()) {
+            return "(empty)";
+        }
+        return s.length() <= RAW_CAP ? s : s.substring(0, RAW_CAP) + "...[truncated]";
+    }
+
+    /** Attempt number for the log; 1 when called outside an activity context. */
+    private static int currentAttempt() {
+        try {
+            return Activity.getExecutionContext().getInfo().getAttempt();
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    private static String envOrProp(String key, String fallback) {
+        String v = System.getenv(key);
+        if (v == null || v.isBlank()) {
+            v = System.getProperty(key);
+        }
+        return v == null || v.isBlank() ? fallback : v;
     }
 
     private static String snippet(String s) {

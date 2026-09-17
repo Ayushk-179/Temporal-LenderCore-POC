@@ -32,6 +32,11 @@ STATE = {
 }
 COUNTERS = {"loan": 0, "ft": 0, "sanction": 0}
 
+# Pristine copy, taken before anything can flip a knob. /_reset restores THIS —
+# resetting only the counters was not enough: a scenario that set panStatusCode=F
+# leaked into the next scenario and made results look random.
+DEFAULTS = dict(STATE)
+
 def _int(k, d=2):
     try: return int(STATE.get(k, d))
     except (TypeError, ValueError): return d
@@ -136,8 +141,11 @@ class H(BaseHTTPRequestHandler):
             COUNTERS.update(loan=0, ft=0, sanction=0)
             return self._send(200, {"state": STATE})
         if u.path == "/_reset":
+            STATE.clear()
+            STATE.update(DEFAULTS)
             COUNTERS.update(loan=0, ft=0, sanction=0)
-            return self._send(200, {"reset": True, "counters": COUNTERS})
+            print("    [mock] RESET to defaults", flush=True)
+            return self._send(200, {"reset": True, "state": STATE, "counters": COUNTERS})
         n = int(self.headers.get("Content-Length") or 0)
         if n:
             self.rfile.read(n)

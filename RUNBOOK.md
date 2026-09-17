@@ -1,235 +1,967 @@
-# RUNBOOK — running the Temporal LenderFlow POC
+# RUNBOOK — Temporal LenderFlow POC
 
-Operational companion to `README.md`. Everything here was verified on a
-macOS/darwin box with Java 11.0.15, Maven 3.9.16, Temporal CLI 1.8.2.
+## 1. What this is
 
-> **Mocks:** this project ships its own mock server at `mock/mock_lender.py`.
-> `lender-config.json` points at it (`http://localhost:9099`) out of the box.
-> The Beeceptor route table is kept in section 8 as an alternative.
+One generic workflow that runs **every** lender's loan flow. The lender-specific
+parts — stage order, endpoints, payloads, response parsing, retry policy — live in
+an **external config store**, not in the jar.
+
+Adding a lender is a set of config documents. Changing one does not need a
+redeploy, and a change can repair a loan that is **already running**.
+
+What the POC is built to demonstrate, in order of how much it matters:
+
+| # | Claim | Scenario |
+|---|---|---|
+| 1 | A bad config change can be fixed **while a loan is stuck**, with no redeploy and no Temporal Reset | [S7](#s7), [S8](#s8) |
+| 2 | Config changes are **replay-safe** — they change a flow's future, never its past | [S9](#s9), `ReplayCompatibilityTest` |
+| 3 | Durable execution — kill the worker mid-flow, it resumes where it was | [S10](#s10) |
+| 4 | A new lender is **config only**, zero code | [S11](#s11) |
+| 5 | Business rejection vs technical failure are handled differently, and a failed loan is **red in the UI** | [S2](#s2), [S3](#s3) |
+| 6 | A failed fan-out branch parks, and only **it** re-runs — successful siblings are never re-fired | [S4](#s4) |
+| 7 | An operator can **write a value into a running loan** that config cannot reach | [S13](#s13) |
+| 8 | A one-hour poll loop is asserted in milliseconds in tests | [S12](#s12) |
+
+The flow itself:
+
+| Stage | Steps | Temporal primitive |
+|---|---|---|
+| PRECHECK | `nameDobCheck` → `dedupeCheck` → 4 parallel checks | async fan-out, settle-all join, config-driven go/no-go gate |
+| STP | `dedupe` → `customerCreation`* → `dedupeRetry`* → `customerInfo` → `accountInfo` → `loanStatus` | conditional steps, durable poll via `Workflow.sleep` |
+| FUND_TRANSFER | `eSignWait` → `pledgeCardSend` → `fundTransferStatus` | `Workflow.await` on a signal (days-long human wait), poll → park → retry signal |
+
+`*` conditional — governed by `condition` in config, evaluated against workflow context.
+
+Design rationale lives in **[CONFIG-DESIGN.md](CONFIG-DESIGN.md)**. Deeper
+background is kept in the [appendix](#appendix) at the bottom of this file.
 
 ---
 
-## 1. Files — what is actually needed
+## 2. Architecture, scale and UI
 
-**Config now lives OUTSIDE the jar.** `lender-config.json` is no longer read at
-runtime — it is the seed source. `Runner seed` splits it into four documents per
-lender in a config store, and the worker reads that store per stage and per
-activity attempt. See [CONFIG-DESIGN.md](CONFIG-DESIGN.md).
-
-The store is **normalised by stage** — seven collections of small documents, so
-one call is one document and one stage is one document:
+### The three tiers
 
 ```
-config-store/pointers/federal.json                          the ONE mutable doc
-config-store/flows/federal/v1.json                          stage names, in order
-config-store/stages/federal/v1/PRECHECK.json                one doc PER STAGE  -> pinned
-config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json one doc PER CALL   -> hot
-config-store/stage_knobs/federal/t1/PRECHECK.json           retry/timeout PER STAGE
-config-store/transports/federal/t1.json                     baseUrl, static headers
-config-store/lenders/federal.json                           display metadata
+   callers
+        |  start, signal, query           (gRPC :7233)
+        v
+  Temporal Server  ──────────────  UI :8233
+   history · matching · frontend        SQLite (dev) / Cassandra+ES (prod)
+        ^
+        |  workers LONG-POLL OUTBOUND for work
+        |
+  Worker pods  (one task queue per lender: lih-<slug>-work)
+   LenderFlowWorkflowImpl   +   StageActivityImpl
+        |                              |
+        |                              v  HTTP to the lender
+        |                        Config store (files or Mongo)
 ```
 
-In Mongo these are the same seven collections, stored as real BSON:
+**The inversion that explains most of the operational properties:** workers
+long-poll *outbound*. The server never opens a connection to a pod. So pods can
+be behind a firewall, scaled to zero, or restarted mid-flow without the server
+caring — and "is my worker connected" is answered by
+`temporal task-queue describe`, not by network debugging.
 
+### Where the state lives
+
+Workflow state is **event history on the server**, not in the pod. A pod holds a
+cache; if it dies, any other pod replays the history and continues. That is why
+killing the worker mid-flow ([S10](#s10)) is a non-event, and why there is no
+`PendingCorrelation` collection, no `poll_lock` in Redis, and no re-enqueue path.
+
+### Scale, in one line each
+
+- **One workflow class, N lenders.** Isolation is one task queue per lender
+  (`lih-<slug>-work`), so a slow lender cannot starve another.
+- **Parked loans cost nothing.** `eSignWait` for 72h and a 30-poll status loop
+  consume no thread and no pod — they are timers on the server.
+- **The real limits**, in order of likelihood: history size per workflow (keep
+  under ~10k events; continue-as-new for long flows), Temporal Actions billing on
+  chatty retry policies, and visibility-store load if you over-index search
+  attributes. Detail in [A5](#a5-architecture--how-temporal-is-working-here).
+
+### UI
+
+`temporal server start-dev` serves the UI on **<http://localhost:8233>**.
+
+What to look at during a demo:
+- **Workflows list** → click a loan → **History** tab shows every activity,
+  timer and signal, with inputs and results.
+- Activity names are config-derived (`PRECHECK.panValidation`,
+  `FUND_TRANSFER.disburse`), so the timeline reads like the flow instead of a
+  stack of identical boxes. That choice has a production caveat — see
+  [A6.1](#a61-ui-naming--dynamic-activity-vs-setsummary).
+- **Pending Activities** on a running workflow shows the current attempt number
+  and the next retry time — this is where you watch a retry ladder burn down in
+  [S7](#s7).
+
+---
+
+## 3. Config — where it lives, what is in it, how to change it
+
+### Where
+
+`lender-config.json` is **only a seed source**. It is not read while a flow runs.
+`Runner seed` normalises it into **seven collections** of small documents:
+
+| collection | id | holds | when it is read |
+|---|---|---|---|
+| `pointers` | `federal` | **the only mutable doc** — which versions are live | every lookup |
+| `flows` | `federal:v1` | stage names, in order | once, at workflow start |
+| `stages` | `federal:v1:PRECHECK` | one doc **per stage**: steps, modes, conditions, gates | once, at workflow start (**pinned**) |
+| `stage_knobs` | `federal:t1:PRECHECK` | one doc **per stage**: retry policy, timeouts | **once per stage boundary** |
+| `bindings` | `federal:b1:PRECHECK.nameDobCheck` | one doc **per call**: method, path, request template, extract, predicates | **every activity attempt** (hot) |
+| `transports` | `federal:t1` | baseUrl, static headers | every activity attempt |
+| `lenders` | `federal` | display metadata | — |
+
+**The three read points are the whole design.** Flow *shape* is pinned at start
+so it cannot shift under a running loan. Retry/timeout *knobs* are re-read at each
+stage boundary. The *wire contract* is resolved inside the activity on every
+attempt — which is why editing a payload repairs a loan that is mid-retry.
+
+### Two backends, same seven collections
+
+| | selected by | layout |
+|---|---|---|
+| **files** (default) | `CONFIG_STORE=file`, `CONFIG_DIR=./config-store` | each `:` becomes a directory |
+| **Mongo** | `CONFIG_STORE=mongo`, `MONGO_URI`, `MONGO_DB` | real BSON, indexed, queryable |
+
+```
+config-store/pointers/federal.json
+config-store/stages/federal/v1/PRECHECK.json
+config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json
+config-store/stage_knobs/federal/t1/FUND_TRANSFER.json
+```
+
+Neither backend caches — deliberately, so an edit lands on the next attempt and
+you can *see* it. Production would cache immutable versions forever and re-read
+only the pointer.
+
+### How to change it
+
+```bash
+# see everything the store currently serves, stage by stage
+mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="show federal"
+```
+
+**File store** — edit one document:
+```bash
+python3 -c "
+import json; p='config-store/bindings/federal/b1/STP.customerInfo.json'
+d=json.load(open(p)); d['path']='/stp/v2/customer-info'; json.dump(d,open(p,'w'),indent=2)"
+```
+
+**Mongo** — one `updateOne`:
+```bash
+docker exec mongodb mongosh lender_config --quiet --eval \
+  'db.bindings.updateOne({_id:"federal:b1:STP.customerInfo"},
+                         {$set:{path:"/stp/v2/customer-info"}})'
+```
+
+Useful Mongo queries:
 ```js
-db.bindings.find({ lenderSlug: "federal", stage: "FUND_TRANSFER" })
-db.bindings.updateOne({_id: "federal:b1:STP.customerInfo"},
-                      {$set: {path: "/stp/v2/customer-info"}})
+db.bindings.find({lenderSlug:"federal", stage:"FUND_TRANSFER"})  // per-stage view
+db.stage_knobs.findOne({_id:"federal:t1:PRECHECK"})              // one stage's knobs
+db.pointers.findOne({_id:"federal"})                             // what is live
 ```
 
-That second command repairs a loan currently in retry backoff.
+**Publishing a version** is a pointer flip; **rollback** is flipping it back.
+Every other document is immutable and version-named.
 
-Store selection is environmental, so the seeder and worker cannot disagree:
+Payload templates support nested JSON, typed leaves, defaults and optional keys:
 
-| var | default | notes |
-|---|---|---|
-| `CONFIG_STORE` | `file` | `file` or `mongo` |
-| `CONFIG_DIR` | `./config-store` | file store root |
-| `MONGO_URI` | `mongodb://localhost:27017` | used when `CONFIG_STORE=mongo` |
-| `MONGO_DB` | `lender_config` | |
+```json
+"request": {
+  "applicant": { "name": "${ctx.customerName | upper}", "pan": "${ctx.pan}" },
+  "amount":       "${num:ctx.loanAmount ?: 150000}",
+  "consent":      "${bool:ctx.consentGiven ?: \"true\"}",
+  "?middleName":  "${ctx.middleName}"
+}
+```
 
-| File | Needed | Notes |
-|---|---|---|
-| `config-store/` | **Required at runtime** (file mode) | Generated by `Runner seed`; gitignored. Edit any document freely **while the worker runs** — no restart. |
-| Mongo `lender_config` db | **Required at runtime** (mongo mode) | `docker run -d --name mongodb -p 27017:27017 mongo:7.0`, then `CONFIG_STORE=mongo Runner seed`. |
-| `src/main/resources/lender-config.json` | Seed source | Read by `Runner seed` only. Not read during a flow. |
-| `pom.xml` | **Required** | Dependencies resolve from `~/.m2`; already cached, so `-o` works. |
-| `mock/mock_lender.py` | Required for live demo | Local mock for all 17 routes, both lenders. |
-| `RUNBOOK.md` | Reference | This file. |
-| `target/` | Generated | Safe to `mvn clean`. |
-
-### Config state to be aware of
-
-`lender-config.json` (and therefore the seeded store) is tuned for **live demos**,
-not production values:
-
-| Field | Current | Original |
-|---|---|---|
-| `federal.transport.baseUrl` | `http://localhost:9099` | `https://fed-mock.free.beeceptor.com` |
-| `demobank.transport.baseUrl` | `http://localhost:9099` | `https://demobank-mock.free.beeceptor.com` |
-| `pollIntervalSeconds` (×3 federal) | `10` | `120` |
-| `pollIntervalSeconds` (×1 demobank) | `10` | `30` |
-
-Keep `10` for demos — at 120s a poll demo takes an hour. Restore the 120/30
-values before treating the config as representative of production timings.
-
-After changing `lender-config.json` you must re-run `Runner seed` for it to reach
-the store. Or just edit `config-store/` directly, which is the point.
+An unresolved `${ctx.x}` with no `?:` default **fails loudly** rather than sending
+an empty string. Response side supports dot paths, array indexing
+(`$.data.items[0].ref`) and regex capture (`regex:$.message:/REF-(\d+)/`).
 
 ---
 
-## 2. Prerequisites
+## 4. Running the POC
+
+### Prerequisites
 
 ```bash
 java -version      # 11.x — the pom targets release 11
-mvn -v             # 3.x
-temporal --version # Temporal CLI
-python3 -V         # 3.7+ — stdlib only, no pip install needed
+mvn -version
+temporal --version # brew install temporal
+python3 --version  # for the mock
+docker --version   # only if using CONFIG_STORE=mongo
 ```
 
-Install the Temporal CLI if missing:
+Dependencies are cached in `~/.m2`, so every command below uses `-o` (offline).
+
+### Tests only — no server, no mocks
 
 ```bash
-brew install temporal
+mvn -o test
 ```
+36 tests. The 1 skip is a deliberate fixture-capture test gated behind
+`-Dregen.histories=true`. A one-hour poll loop runs in milliseconds because
+`TestWorkflowEnvironment` skips time.
 
----
-
-## 3. Quick start — tests only (no server, no mocks)
-
-```bash
-mvn test
-```
-
-6 tests, ~7 seconds. Runs entirely in-process on `TestWorkflowEnvironment` —
-**no Temporal server, no mock, no network.**
-
-This is also the single most persuasive demo in the repo:
-`loanStatusPoll_exhausts_thenParksForManualRetrySignal` skips 30 × 120s of wall
-clock (one hour) and asserts in milliseconds.
-
----
+### Full live demo — four terminals, in this order
 
 ```bash
-pkill -f "com.rupeek.poc.temporal.Runner"   # workers
-pkill -f mock_lender.py                     # mock
-pkill -f "temporal server start-dev"        # server
-```
-
-## 4. Full live demo — startup order
-
-Four processes. Each must be up before the next.
-
-### Terminal 0 — seed the config store (once, no server needed)
-
-```bash
+# Terminal 0 — seed the config store (once; no server needed)
 mvn -o -q compile
 mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="seed"
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="show federal"
-```
-Writes 7 collections for both lenders (6 stage docs, 17 binding docs, 6
-stage_knobs docs). **Nothing runs without this** — the worker reads the store,
-not the jar. `show` prints the whole flow stage by stage with each step's mode,
-gate and resolved endpoint.
 
-For the Mongo-backed variant:
+#   ...or Mongo-backed:
+#   docker run -d --name mongodb -p 27017:27017 mongo:7.0
+#   export CONFIG_STORE=mongo      # export in EVERY terminal below
+#   mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="seed"
 
-```bash
-docker run -d --name mongodb -p 27017:27017 mongo:7.0
-export CONFIG_STORE=mongo          # keep this exported for the worker terminal too
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="seed"
-```
+# Terminal 1 — Temporal server (UI at http://localhost:8233)
+temporal server start-dev
 
-### Terminal 1 — Temporal server
-
-```bash
-temporal server start-dev --ui-port 8233
-```
-Single binary. In-memory: **all workflow state is lost on restart**, and
-default retention is 24h. UI: <http://localhost:8233>
-
-### Terminal 2 — mock lender APIs
-
-```bash
+# Terminal 2 — mock lender APIs (all routes, both lenders, port 9099)
 python3 mock/mock_lender.py
-```
-Serves all 17 routes for both lenders on `http://localhost:9099`.
 
-### Terminal 3 — worker (this is the one that blocks)
-
-```bash
+# Terminal 3 — worker. THIS ONE BLOCKS. Do NOT use -q, or you get no logs.
 mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker federal"
 ```
-**Nothing executes without a worker.** `start` only enqueues; the flow runs
-inside this process. For the second lender, in another terminal:
 
-```bash
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker demobank"
-```
+> **`-q` silences all logging.** `exec:java` runs inside Maven's JVM, so slf4j
+> binds to Maven's logger and `-q` suppresses every INFO line. The flow still
+> runs; you just cannot watch it. Drop `-q` on the worker terminal.
 
-One worker per lender — task queue `lih-<slug>-work`. That is the per-lender
-isolation story: separate queue, separate scaling, no new infra.
-
-On boot it prints where config comes from:
-
-```
-worker up on lih-federal-work — config from file:/.../config-store
-config is read per stage and per activity attempt; edit it while this runs, no restart needed
-```
-
-**Leave this terminal alone for the rest of the demo.** Everything in §12 happens
-without restarting it — that is the whole point.
-
-### Terminal 4 — drive it
-
-```bash
-R="mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="
-
-$R '-Dexec.args=start federal LR-1001'
-
-$R '-Dexec.args=signal LR-1001 pledgeCardReady'
-$R '-Dexec.args=status LR-1001'
-
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner \
-  -Dexec.args="start federal LR-1003"
-  
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner \
-  -Dexec.args="status LR-1003"
-    
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner \
-  -Dexec.args="signal LR-1003 pledgeCardReady"
-
-
-$R"start federal LR-1001"
-$R"status LR-1001"
-$R"signal LR-1001 pledgeCardReady"
-$R"start demobank LR-2001"
-```
-$R"signal LR-1001 pledgeCardReady"
-
-temporal workflow signal -w lender-flow-RB-2 --name pledgeCardReady --input '{}'
-
-**Always pass `-o`** (offline). It skips dependency resolution — several seconds
-off every invocation, which matters when running these live.
-
-### What each command replaces in production
-
-| Command | Production equivalent |
-|---|---|
-| `start federal LR-1001` | `POST /lenderSanctionRequest` |
-| `signal LR-1001 pledgeCardReady` | `PUT /v1/disbursement` (was a Zeebe message publish) |
-| `signal LR-1001 retryLoanStatus` | `GET /workflow/publish-event?eventName=...` |
-| `status LR-1001` | a Mongo read + Camunda Operate |
-
-### Workflow IDs are single-use
-
-`Runner.java:92` sets `WorkflowIdReusePolicy.REJECT_DUPLICATE`, so re-running
-`start federal LR-1001` fails until retention expires. **That is the idempotency
-proof** (it replaces `exec_lock` in Redis) — use a fresh `LR-` id each run.
+Terminal 4 is where you drive the scenarios below.
 
 ---
 
-## 5. Mock server — commands and scenario control
+## 5. Reset — run this after EVERY scenario
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+```
+1/3 config  wiped and re-seeded into file:/.../config-store (6 stages, 17 bindings)
+2/3 mock    scenario knobs restored via http://localhost:9099/_reset (HTTP 200)
+3/3 temporal deleted 1 execution(s) (all lender-flow-*)
+ready — workflow IDs are free to reuse
+```
+
+Three stores drift during a demo and **all three must move together**, or the
+next scenario silently inherits the last one's state:
+
+1. **config store** — a scenario edited a binding or a knob
+2. **mock** — a scenario flipped `panStatusCode`, `dedupeFlag`, a poll counter
+3. **Temporal** — workflow IDs are single-use, so a finished loan blocks its own
+   ID from being started again
+
+Two details that make it actually clean:
+
+- It **wipes** the config store before re-seeding, rather than overwriting it.
+  Re-seeding alone would leave behind whatever a scenario published — a `b2`
+  binding version, an extra stage — so the next scenario would start from a store
+  that only looks pristine.
+- It **deletes** (not just terminates) the executions, which is what frees the
+  workflow ID — so every scenario below reuses `LR-1001` and stays copy-paste.
+
+`reset <loanRequestId>` targets one loan instead of all of them. The worker keeps
+running throughout; reset never touches it.
+
+---
+
+## 6. Test scenarios
+
+Every scenario is four blocks in this order — **db/config**, **mock**,
+**project**, **temporal** — then reset. Skip a block when it says *(none)*.
+Terminal 3 (worker) stays up the whole time.
+
+Shorthand used below:
+```bash
+alias runner='mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args'
+# then:  runner "start federal LR-1001"
+```
+
+---
+
+### S1 — Happy path <a id="s1"></a>
+
+Proves the whole flow runs from config: 3 stages, a 4-way fan-out, two poll
+loops, one human signal.
+
+```bash
+# 1. db/config   (none — seeded defaults)
+# 2. mock        (none — defaults are the happy path)
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 30
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+
+# 4. temporal
+temporal workflow show -w lender-flow-LR-1001 | grep -E "^  Status|Result"
+```
+**Expect** `Status COMPLETED`, and `"outcome":"COMPLETED"` with `utr` in the
+result context. In the worker log, every step logs its `binding=b1` provenance.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S2 — Business rejection: no retries <a id="s2"></a>
+
+A lender decline is an **answer, not a fault**. It must not be retried and must
+not park.
+
+```bash
+# 1. db/config   (none)
+
+# 2. mock
+curl -s "localhost:9099/_set?panStatusCode=F" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 20
+
+# 4. temporal
+temporal workflow list | head -3
+temporal workflow show -w lender-flow-LR-1001 | grep -E "^  Status"
+```
+**Expect** `Status  Failed` — **red in the UI**, not green "Completed". A loan that
+did not disburse is never shown as a success. The failure carries the type so a
+decline stays distinguishable from an outage:
+
+```bash
+temporal workflow show -w lender-flow-LR-1001 -o json | grep -o '"type":"BUSINESS_REJECT"'
+```
+```
+message : REJECTED at PRECHECK/parallelChecks — parallelChecks rejected by lender: panValidation
+type    : BUSINESS_REJECT
+```
+
+Reached in **one attempt** — the worker log says
+`BUSINESS REJECT — lender declined; no retry, no park`. The sibling branches still
+ran and recorded results (settle-all, not fail-fast).
+
+> Because declines and outages both show as `Failed`, "failed workflow count" on
+> its own is not an alerting signal — filter by failure type, or a busy day of
+> declines looks like an incident.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S3 — Technical failure: retries with backoff <a id="s3"></a>
+
+Same config surface, correctly different behaviour from S2.
+
+```bash
+# 1. db/config   (none)
+
+# 2. mock
+curl -s "localhost:9099/_set?dedupeHttp=500" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+
+# 4. temporal — watch the retry ladder live
+temporal workflow describe -w lender-flow-LR-1001 | grep -A6 "Pending Activities"
+```
+**Expect** 3 attempts at 2s → 4s backoff, then the step **PARKS** for up to 72h
+rather than failing the loan. The worker log shows `attempt 1/2/3 ... HTTP 500`
+then `PARKED`, with the exact command to rescue it. Every mode that can suffer a
+technical failure now parks — SYNC, POLL and PARALLEL ([S4](#s4)); only
+`AWAIT_SIGNAL` does not, because it is already a wait.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S4 — A failed PRECHECK branch parks, and only it re-runs <a id="s4"></a>
+
+A technical failure inside the parallel fan-out parks the step, exactly like a
+SYNC step. On release **only the failed branch re-runs** — a branch that already
+succeeded is never re-fired, which for a lender call with a side effect would be
+a duplicate request.
+
+```bash
+# 1. db/config   (none)
+
+# 2. mock — the PAN endpoint starts 500ing
+curl -s "localhost:9099/_set?panHttp=500" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 35
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+
+# 4. temporal   (none)
+```
+**Expect** `"parkedAt": "PRECHECK/parallelChecks"`, `waitingOnSignal: retryStep`,
+and the branch tally showing three SUCCESS and one FAILED:
+```
+parallelChecks.panValidation.outcome     FAILED
+parallelChecks.unNameCheck.outcome       SUCCESS
+parallelChecks.panAadhaarLink.outcome    SUCCESS
+parallelChecks.mobileAadhaarLink.outcome SUCCESS
+```
+
+```bash
+# 2. mock — fix the endpoint
+curl -s "localhost:9099/_set?panHttp=200" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
+sleep 20
+```
+**Expect** in the worker log — note `[panValidation] only`:
+```
+FANOUT PRECHECK/parallelChecks RELEASED by retryStep — re-resolving config (transport=t1) and re-running [panValidation] only
+BRANCH PRECHECK/parallelChecks/panValidation LAUNCH (round 2) mandatory=true retry=3x
+GATE PRECHECK/parallelChecks -> PROCEED
+```
+Proof from the mock's own request log: `/precheck/pan` was hit **4** times
+(3 failed attempts + 1 after the fix) while `/precheck/un-name` was hit exactly
+**1** time.
+
+The park waits `parkTimeoutHours` — **72h by default, the same three days as the
+e-sign wait**. If nobody signals in that window the loan fails with
+`TECHNICAL_FAILURE` and goes red.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S5 — Conditional steps: existing customer <a id="s5"></a>
+
+Branching lives in config, evaluated against workflow context.
+
+```bash
+# 1. db/config   (none)
+
+# 2. mock
+curl -s "localhost:9099/_set?dedupeFlag=Y&lenderCustomerId=CIF-9" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 25
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+sleep 15
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+
+# 4. temporal   (none)
+```
+**Expect** `customerCreation` and `dedupeRetry` both `SKIPPED`. The worker log
+says exactly why:
+`STEP STP/customerCreation SKIPPED — ctx.dedupeFlag EQUALS N [actual=Y]`
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S6 — Fan-out width decided by config <a id="s6"></a>
+
+The parallel group runs 2 branches instead of 4, with no code change.
+
+```bash
+# 1. db/config   (none)
+
+# 2. mock
+curl -s "localhost:9099/_set?aadhaarChecksNeeded=false" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 20
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+
+# 4. temporal   (none)
+```
+**Expect** `panAadhaarLink` and `mobileAadhaarLink` `SKIPPED`, gate reports
+`2/2 ok`. Worker log: `FANOUT PRECHECK/parallelChecks awaiting 2 branch(es)`.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S7 — THE HEADLINE: fix a stuck loan by editing config <a id="s7"></a>
+
+A bad endpoint breaks a live loan. Fix the config; the loan repairs itself. **The
+worker is never restarted and nothing is redeployed.**
+
+```bash
+# 1. db/config — break one binding while the loan is running
+python3 -c "
+import json; p='config-store/bindings/federal/b1/FUND_TRANSFER.pledgeCardSend.json'
+d=json.load(open(p)); d['path']='/broken/pledge-card'; json.dump(d,open(p,'w'),indent=2)"
+#    Mongo equivalent:
+#    docker exec mongodb mongosh lender_config --quiet --eval \
+#      'db.bindings.updateOne({_id:"federal:b1:FUND_TRANSFER.pledgeCardSend"},
+#                             {$set:{path:"/broken/pledge-card"}})'
+
+# 2. mock   (none)
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 30
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+sleep 30
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+```
+**Expect** `"parkedAt": "FUND_TRANSFER/pledgeCardSend"`, `waitingOnSignal: retryStep`.
+The worker log shows `RESOLVED ... binding=b1` on **every attempt** — that is the
+hot-config mechanism, visible.
+
+```bash
+# 1. db/config — fix it
+python3 -c "
+import json; p='config-store/bindings/federal/b1/FUND_TRANSFER.pledgeCardSend.json'
+d=json.load(open(p)); d['path']='/ft/pledge-card'; json.dump(d,open(p,'w'),indent=2)"
+
+# 3. project — release the parked step
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
+sleep 25
+
+# 4. temporal
+temporal workflow show -w lender-flow-LR-1001 | grep -E "^  Status"
+```
+**Expect** `COMPLETED`. Worker log: `RELEASED by retryStep — re-resolving config`.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S8 — Change the API payload shape at runtime <a id="s8"></a>
+
+Turn a flat payload into a nested, typed one — the kind of change that used to be
+a code change. Includes a deliberately missing field to show strict mode.
+
+```bash
+# 1. db/config
+python3 - <<'EOF'
+import json
+p = 'config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json'
+d = json.load(open(p))
+d['request'] = {
+  "requestId":    "${ctx._requestId}",
+  "applicant":    {"name": "${ctx.customerName | upper}",
+                   "dob":  "${ctx.dob}",
+                   "pan":  "${ctx.pan}"},
+  "amount":       "${num:ctx.loanAmount ?: 150000}",
+  "consent":      "${bool:ctx.consentGiven ?: \"true\"}",
+  "branchCode":   "${ctx.branchCode}",
+  "?middleName":  "${ctx.middleName}"
+}
+json.dump(d, open(p, 'w'), indent=2)
+EOF
+
+# 2. mock   (none)
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 25
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+```
+**Expect** parked at `PRECHECK/nameDobCheck`. The worker log names the exact
+problem and every key that *was* available:
+```
+TEMPLATE ERROR [binding b1] unresolved template ${ctx.branchCode}
+  — context has no value for 'ctx.branchCode' and no ?: default was given
+  | ctx keys available: [customerName, pan, mobile, dob, ...]
+```
+The old renderer would have sent `"branchCode": ""` to the bank without a word.
+
+```bash
+# 1. db/config — add a default
+python3 -c "
+import json; p='config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json'
+d=json.load(open(p)); d['request']['branchCode']='\${ctx.branchCode ?: \"BLR-001\"}'
+json.dump(d,open(p,'w'),indent=2)"
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
+sleep 25
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+sleep 25
+
+# 4. temporal
+temporal workflow show -w lender-flow-LR-1001 | grep -E "^  Status"
+```
+**Expect** `COMPLETED`, and in the log the rendered nested body with
+`"branchCode":"BLR-001"`.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S9 — Config changes the future, never the past <a id="s9"></a>
+
+Publish a new binding version while a loan is parked. The loan picks it up for
+work **not yet done**; what already happened is untouched, and the recorded
+history still replays cleanly.
+
+```bash
+# 3. project — start a loan and let it park on the e-sign wait
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 30
+
+# 1. db/config — publish b2 and flip the pointer
+python3 - <<'EOF'
+import json, pathlib, shutil
+src = pathlib.Path('config-store/bindings/federal/b1')
+dst = pathlib.Path('config-store/bindings/federal/b2')
+shutil.copytree(src, dst, dirs_exist_ok=True)
+for f in dst.glob('*.json'):
+    d = json.load(open(f)); d['bindingVersion'] = 'b2'; json.dump(d, open(f,'w'), indent=2)
+p = 'config-store/pointers/federal.json'
+d = json.load(open(p)); d['bindingVersion'] = 'b2'; json.dump(d, open(p,'w'), indent=2)
+EOF
+
+# 3. project — release it and check provenance
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+sleep 25
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+```
+**Expect** `lastBindingVersion: b2`; steps completed *before* the flip still show
+`b1` in their history records. `skeletonVersion` is unchanged — flow shape is
+pinned for the life of the loan.
+
+```bash
+# 4. temporal — the proof: the recorded history still replays against current code
+mvn -o test -Dtest=ReplayCompatibilityTest
+```
+**Expect** 7/7 green. Rollback is flipping `bindingVersion` back to `b1`.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S10 — Durability: kill the worker mid-flow <a id="s10"></a>
+
+Lead a demo with this one. Nothing else lands as hard.
+
+```bash
+# 2. mock — make loan-status poll for a while so there is time to kill the worker
+curl -s "localhost:9099/_set?loanStatusSucceedsAfter=8" >/dev/null
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 30
+#    >>> now ctrl-C Terminal 3 (the worker), wait 10s, and start it again:
+#    mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker federal"
+sleep 40
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+
+# 4. temporal
+temporal workflow describe -w lender-flow-LR-1001 | grep -E "Status|HistoryLength"
+```
+**Expect** the poll loop resumes at the same attempt. No state was lost, because
+none of it was in the pod. The restarted worker **replays** history — and the
+replay-aware logger means the log does not re-print the earlier stages.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+### S11 — A new lender, config only <a id="s11"></a>
+
+A completely different stage graph on the same jar.
+
+```bash
+# 3. project — needs its own worker on its own task queue (new terminal)
+mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker demobank"
+#    then, in terminal 4:
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="show demobank"
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start demobank LR-2001"
+sleep 40
+
+# 4. temporal
+temporal workflow show -w lender-flow-LR-2001 | grep -E "^  Status"
+```
+**Expect** `COMPLETED`. DemoBank has 3 stages with entirely different steps
+(`combinedPrecheck` → `sanction` poll → `disburse`) and zero code was written.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset LR-2001"
+```
+
+---
+
+### S12 — Time-skipped tests <a id="s12"></a>
+
+```bash
+# 3. project only — no server, no mock, no worker
+mvn -o test
+```
+**Expect** 36 tests, ~15s. A 30-poll loop at 120s intervals is an hour of wall
+clock and runs in milliseconds. Then ask how that flow is tested today.
+
+Worth naming individually:
+- `bindingEditedMidRetry_healsTheLoan_withNoRedeploy` — S6, automated
+- `replayIsClean_afterTheBindingChangedMidFlight` — S8, automated
+- `skeletonChange_doesNotLeakIntoARunningExecution` — shape pinning
+- `ReplayCompatibilityTest` — replays 6 committed histories against current code
+- **`ConfigDeterminismTest`** — the counterfactual: two workflows, the same config
+  edit, one breaks on replay and one does not. See below.
+
+**Why `ConfigDeterminismTest` is worth reading.** It is the only test that proves
+the *reason* for the design rather than the behaviour. It runs two workflows
+against the same store and makes the same edit under both:
+
+| workflow | reads config | result after the edit |
+|---|---|---|
+| `DriftingWorkflowImpl` (test-only, deliberately wrong) | from **workflow code** | `NonDeterministicException` — `Event 71 of type EVENT_TYPE_ACTIVITY_TASK_SCHEDULED does not match command type COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION` |
+| `LenderFlowWorkflowImpl` (real) | inside an **activity** | replays clean |
+
+That is the whole argument for the pointer design. A mutable pointer is safe
+*precisely because the workflow never dereferences it* — the activity does, and
+activity results are immutable history. Note the failure mode it prevents: the
+drifting workflow would not "pick up new config", it would **stall**, retrying the
+same workflow task forever while ops sees a loan that simply stops.
+
+*(no reset needed — tests are hermetic)*
+
+---
+
+### S13 — Patch a running loan's context <a id="s13"></a>
+
+The one case config **cannot** fix: the lender now demands a value that nobody
+ever captured. No binding edit helps, because the value does not exist anywhere
+in the loan. Write it into the running workflow by hand.
+
+```bash
+# 1. db/config — make a binding demand a key nothing produces
+python3 -c "
+import json; p='config-store/bindings/federal/b1/STP.customerInfo.json'
+d=json.load(open(p)); d['request']['branchCode']='\${ctx.branchCode}'
+json.dump(d,open(p,'w'),indent=2)"
+
+# 2. mock   (none)
+
+# 3. project
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-1001"
+sleep 40
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+```
+**Expect** `"parkedAt": "STP/customerInfo"` — strict rendering refused to send a
+blank, so the step parked instead of shipping `"branchCode": ""` to the bank.
+
+```bash
+# 3. project — write the missing value straight into the live loan
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner \
+    -Dexec.args="patch LR-1001 branchCode=BLR-042 agentId=AG-9"
+
+# identity keys are refused — try it and see
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner \
+    -Dexec.args="patch LR-1001 loanRequestId=LR-HIJACK"
+
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="status LR-1001"
+```
+**Expect** in `status`:
+```
+branchCode    BLR-042
+agentId       AG-9
+loanRequestId LR-1001          <- unchanged, the patch was refused
+history       CONTEXT_PATCHED        operator set [branchCode, agentId] (was {branchCode=null, agentId=null})
+              CONTEXT_PATCH_REFUSED  all keys protected: [loanRequestId]
+```
+
+`loanRequestId`, `lenderSlug` and `_requestId` are refused outright. Rewriting
+`loanRequestId` mid-flight would re-point every downstream idempotency key at a
+different loan — a double-disbursal path dressed up as an ops convenience.
+
+Every patch is written into the step history, so it is auditable in `status` and
+in the Temporal UI. The signal is fire-and-forget, which is why the CLI says
+"sent" and tells you to confirm with `status` rather than claiming success.
+
+```bash
+# 3. project — release the parked step; the re-run renders the patched value
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 retryStep"
+sleep 25
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-1001 pledgeCardReady"
+sleep 25
+
+# 4. temporal
+temporal workflow show -w lender-flow-LR-1001 | grep -E "^  Status"
+```
+**Expect** `COMPLETED`, with `branchCode` and `agentId` in the final context and
+the outgoing payload carrying `"branchCode":"BLR-042"`.
+
+> This is the most dangerous command in the API — it edits live loan state with no
+> schema and no validation, and the change is permanent in history. It exists
+> because the alternative (terminate and re-run a part-disbursed loan) is worse.
+
+```bash
+mvn -o -q exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="reset"
+```
+
+---
+
+## 7. Suggested demo order
+
+1. **S10 durability** — kill the worker. Lead with it.
+2. **S7 hot config fix** — the loan repairs itself from a config edit.
+3. **S11 new lender** — different flow, same jar.
+4. **S12 tests** — an hour-long poll asserted in milliseconds.
+5. **S2 vs S3** — rejection and failure, correctly different, both from config.
+6. **The deletion slide** — what this removes:
+
+| Component today | Replaced by |
+|---|---|
+| `PendingCorrelation` store | workflow state |
+| `contextSnapshot` in Mongo | `loadFlowSkeleton` activity result in event history |
+| `poll_lock` in Redis | `Workflow.sleep` in the poll loop |
+| `ASYNC_RESUME` → re-enqueue | the loop never stopped |
+| `exec_lock:{slug}:{lr}:{stage}` | workflow ID + `WorkflowIdReusePolicy` |
+| SQS FIFO work queue per lender | task queue per lender |
+| DLQ + replay admin | failed workflow stays queryable; park + `retryStep`, or reset |
+| `lender-async-service` (whole service) | — |
+
+---
+
+## 8. What this POC does NOT prove
+
+- **Not load tested.** No throughput, latency or cost numbers under real volume.
+- **No production config governance** — no schema validation, no dataflow
+  validator, no approvals, no RBAC, no audit. See
+  [CONFIG-DESIGN.md §7](CONFIG-DESIGN.md#7-what-was-not-built-and-why) for the
+  full list of 18 things deliberately left out, and why each matters.
+- **Step identity is still config step NAMES.** Renaming a step changes the
+  idempotency key — a double-disbursal path. Immutable UIDs must land before any
+  of this is editable in production. This is the #1 outstanding risk.
+- **No security work** — mTLS, namespace isolation, payload encryption, PII
+  redaction in logs (`LOG_RAW=false` is the only control today).
+- **Real lender APIs are mocked.** Auth, pagination, partial responses and
+  rate limits are all unexplored.
+
+---
+
+<a id="appendix"></a>
+# Appendix — background and detail
+
+Everything below is reference material: the reasoning behind the choices above,
+kept so it is not lost. None of it is needed to run the POC.
+
+---
+
+## A1. Logs — reading a flow without opening the UI
+
+### Getting them to appear
+
+```bash
+# RIGHT — logs at INFO
+mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker federal"
+
+# WRONG — silent
+mvn -o -q exec:java ...
+```
+
+`exec:java` runs in **Maven's own JVM**, so slf4j binds to Maven's logger rather
+than to `slf4j-simple`, and `-q` then suppresses every INFO line the app emits.
+The flow still runs; you just cannot see it. Drop `-q` on the worker terminal.
+
+Levels and toggles live in `src/main/resources/simplelogger.properties`:
+
+| | |
+|---|---|
+| `LOG_RAW=false` | suppress full request/response bodies (they carry PAN, Aadhaar ref, mobile) |
+| `-Dorg.slf4j.simpleLogger.log.com.rupeek.poc.temporal.config.store=debug` | trace every config document read |
+
+### What a healthy step looks like
+
+```
+[INFO] LenderFlowWorkflowImpl - --- STAGE PRECHECK [3 steps] knobs re-read from transport=t1 (retry 3x initial 2s x2.0 backoff, timeout 10s)
+[INFO] LenderFlowWorkflowImpl - STEP PRECHECK/nameDobCheck mode=SYNC onFailure=PARK
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] attempt 1 RESOLVED callKey=PRECHECK.nameDobCheck binding=b1 transport=t1 (re-read from the store on THIS attempt)
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] attempt 1 --> POST http://localhost:9099/precheck/name-dob
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] --> headers {X-Client-Id=rupeek-los-poc, Content-Type=application/json}
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] --> body {"requestId":"RPK-LR-4002-6f0bec48","name":"TEST CUSTOMER","dob":"1990-01-15"}
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] attempt 1 <-- HTTP 200
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] <-- body {"status": "SUCCESS"}
+[INFO] StageActivityImpl      - [PRECHECK/nameDobCheck] attempt 1 EXTRACTED {nameDobStatus=SUCCESS} (terminal=false)
+[INFO] StageActivityImpl      -   successWhen: $.status EQUALS SUCCESS | actual=SUCCESS -> true
+[INFO] LenderFlowWorkflowImpl - STEP PRECHECK/nameDobCheck SUCCESS http=200 binding=b1 extracted={nameDobStatus=SUCCESS}
+```
+
+Every decision the config drove is on one line with the value it saw:
+
+```
+CONDITION PRECHECK/parallelChecks/panAadhaarLink : ctx.aadhaarChecksNeeded EQUALS true [actual=true] -> true
+STEP STP/dedupeRetry SKIPPED — ctx.customerId BLANK [actual=CIF-1001]
+BRANCH PRECHECK/parallelChecks/mobileAadhaarLink LAUNCH mandatory=false retry=4x timeout=10s
+FANOUT PRECHECK/parallelChecks awaiting 4 branch(es) — settle-all, not fail-fast
+GATE PRECHECK/parallelChecks 4/4 ok | quorumMet=true (minSuccess=0) onBranchFailure=FAIL
+GATE PRECHECK/parallelChecks -> PROCEED
+POLL STP/loanStatus attempt 1/30 http=200 terminal=true binding=b1 extracted={fedLoanStatus=SUCCESS}
+WAIT FUND_TRANSFER/eSignWait awaiting signal 'pledgeCardReady' for up to 72h (zero resource cost)
+```
+
+### What a broken binding looks like
+
+Note `RESOLVED` on **every attempt** — that is the hot-config mechanism visible in
+the log, and the window in which an edit lands:
+
+```
+[INFO ] [STP/customerInfo] attempt 1 RESOLVED callKey=STP.customerInfo binding=b1 transport=t1
+[ERROR] [STP/customerInfo] attempt 1 TEMPLATE ERROR [binding b1] unresolved template ${ctx.missingThing}
+        — context has no value for 'ctx.missingThing' and no ?: default was given
+        | ctx keys available: [customerName, pan, mobile, ... customerId, _requestId]
+[INFO ] [STP/customerInfo] attempt 2 RESOLVED ...
+[INFO ] [STP/customerInfo] attempt 3 RESOLVED ...
+[WARN ] STEP STP/customerInfo PARKED — retries exhausted: ... type='CONFIG_ERROR'
+[WARN ] STEP STP/customerInfo waiting for retryStep. Fix the binding document in the
+        config store, then: Runner signal LR-4003 retryStep
+```
+
+The error names the template, the binding version, and every context key that
+*was* available — which is usually enough to write the fix without opening
+anything else. After the fix:
+
+```
+[INFO] SIGNAL received: retryStep
+[INFO] STEP STP/customerInfo RELEASED by retryStep — re-resolving config (transport=t1, retry 3x) and re-running the step
+[INFO] [STP/customerInfo] --> body {"requestId":"...","customerId":"CIF-1001","branchCode":"BLR-001"}
+[INFO] STEP STP/customerInfo SUCCESS http=200 binding=b1 extracted={customerInfoStatus=SUCCESS}
+```
+
+### Why the workflow uses a different logger
+
+`LenderFlowWorkflowImpl` logs through `Workflow.getLogger(...)`, not
+`LoggerFactory.getLogger(...)`. A workflow method re-executes from the top on
+every replay, so a plain logger would re-emit every line each time a worker picks
+the workflow up — a loan parked for a day would print its PRECHECK log dozens of
+times and the log would read as though the flow ran dozens of times.
+`Workflow.getLogger` is replay-aware and stays quiet while replaying.
+
+Activities do not replay, so `StageActivityImpl` uses a normal slf4j logger and
+stamps each line with `Activity.getExecutionContext().getInfo().getAttempt()`.
+
+---
+
+## A2. Mock server — every scenario knob
 
 Start it:
 
@@ -243,8 +975,8 @@ conditions live in config, not compiled code**:
 
 ```bash
 curl localhost:9099/_state           # current knobs + live poll counters
-curl localhost:9099/_reset           # reset poll counters only
-curl "localhost:9099/_set?KEY=VALUE" # flip a knob (also resets counters)
+curl localhost:9099/_reset           # restore ALL knobs to defaults + zero counters
+curl "localhost:9099/_set?KEY=VALUE" # flip a knob (also zeroes counters)
 ```
 
 ### Scenario knobs
@@ -333,7 +1065,10 @@ curl "localhost:9099/_set?mobileAadhaarHttp=500"
 | Tolerable? | yes, via `mandatory:false` / `onBranchFailure:CONTINUE` | never |
 | `outcome` | `FAILED` (or flow continues, degraded) | `REJECTED` |
 
-### The scenario matrix
+### Knob combinations (reference)
+
+The runnable scenarios live in [section 6](#6-test-scenarios) — these are just
+the mock settings each one uses, in case you want to combine them by hand.
 
 ```bash
 # Happy path
@@ -342,7 +1077,7 @@ curl "localhost:9099/_set?panStatusCode=E&dedupeFlag=N&loanStatusSucceedsAfter=2
 # Business rejection — REJECTED, ZERO retries (non-retryable)
 curl "localhost:9099/_set?panStatusCode=F"
 
-# Technical failure — 3 retries with backoff, then FAILED
+# Technical failure — 3 retries with backoff, then the step PARKS
 curl "localhost:9099/_set?dedupeHttp=500"
 
 # Existing customer — customerCreation + dedupeRetry both SKIPPED
@@ -367,7 +1102,7 @@ there is no mid-flow left to catch when you kill the worker.
 
 ---
 
-## 6. Temporal CLI — the commands that matter here
+## A3. Temporal CLI — the commands that matter here
 
 ```bash
 # --- health ---
@@ -408,94 +1143,7 @@ Three of these carry weight in a review:
 
 ---
 
-## 7. Suggested demo order
-
-1. **Durability.** Set `loanStatusSucceedsAfter=-1`, start a flow, let it enter
-   the poll, `ctrl-C` the worker, restart it. Show the UI resuming mid-poll.
-   Nothing else lands as hard — lead with it.
-2. **Config-only lender.** `start demobank LR-2001`. A completely different stage
-   graph on the same JAR. No deploy, no BPMN, no code.
-3. **Time-skipped tests.** `mvn test` — a one-hour poll loop asserted in
-   milliseconds. Then ask how that flow is tested today.
-4. **Business vs technical failure.** `panStatusCode=F` (no retries, `REJECTED`),
-   then `dedupeHttp=500` (backoff retries, `FAILED`). Same config surface,
-   correctly different behaviour.
-5. **The `status` query.** Live stage history, no Mongo read, no Operate.
-6. **The deletion slide** (see README).
-
----
-
-## 8. Alternative — Beeceptor instead of the local mock
-
-Derived by walking `lender-config.json`, so every field below is one the
-interpreter actually reads. **17 rules** — federal 14 + demobank 3. (README
-says "the 11 below fit" and then lists 14; both are wrong.)
-
-**One endpoint hosts both lenders** — no path collisions. Point both `baseUrl`s
-at the same host.
-
-> ⚠️ **Use exact-path matching, not prefix.** demobank's `/precheck` is a prefix
-> of federal's `/precheck/name-dob`. A prefix rule for `/precheck` swallows all
-> four federal precheck routes.
-
-All rules return **HTTP 200** — the workflow branches on body, not status code.
-
-### Federal — 14 rules
-
-| # | Method | Path | Response body |
-|---|---|---|---|
-| 1 | POST | `/precheck/name-dob` | `{"status":"SUCCESS"}` |
-| 2 | POST | `/precheck/dedupe` | `{"status":"SUCCESS","data":{"ddupe_flag":"N","customer_id":"","aadhaar_checks_needed":"true"}}` |
-| 3 | POST | `/precheck/pan` | `{"panStatusCode":"E","status":"SUCCESS"}` |
-| 4 | POST | `/precheck/un-name` | `{"status":"S"}` |
-| 5 | POST | `/precheck/pan-aadhaar` | `{"status":"SUCCESS"}` |
-| 6 | POST | `/precheck/mobile-aadhaar` | `{"status":"SUCCESS"}` |
-| 7 | POST | `/stp/dedupe` | `{"ddupeFlag":"N","partialKycFlag":"N","lenderCustomerId":""}` |
-| 8 | POST | `/stp/customer-creation` | `{"responseCode":"00","customerId":"CIF-1001","partialKycFlag":"N"}` |
-| 9 | POST | `/stp/dedupe-retry` | `{"lenderCustomerId":"CIF-1001"}` |
-| 10 | POST | `/stp/customer-info` | `{"status":"SUCCESS","referenceNumber":"REF-1"}` |
-| 11 | POST | `/stp/account-info` | `{"statusCode":"200","status":"SUCCESS","loanAccountNumber":"LA-77001"}` |
-| 12 | **GET** | `/stp/loan-status` | `{"loanStatus":"PENDING"}` — flip to `SUCCESS` mid-demo |
-| 13 | POST | `/ft/pledge-card` | `{"statusCode":"200","bpmNumber":"BPM-9001"}` |
-| 14 | **GET** | `/ft/status` | `{"status":"PENDING"}` — flip to `{"status":"SUCCESS","utr":"UTR123456789"}` |
-
-### DemoBank — 3 rules
-
-| # | Method | Path | Response body |
-|---|---|---|---|
-| 15 | POST | `/precheck` | `{"verdict":"PASS","custRef":"DEMO-CUST-1"}` |
-| 16 | **GET** | `/sanction/status` | `{"state":"PENDING"}` — flip to `APPROVED` |
-| 17 | POST | `/disburse` | `{"ok":"true","utr":"UTR-DEMO-999"}` |
-
-Rule 17: `successWhen` compares `$.ok EQUALS "true"` as a **string** — quote it.
-
-### Beeceptor scenario matrix
-
-| Scenario | Edit | Expected |
-|---|---|---|
-| Business rejection | #3 → `{"panStatusCode":"F"}` | `REJECTED`, zero retries |
-| Technical failure | #7 → HTTP **500** | 3 retries, 2s→4s→8s, then `FAILED` |
-| Existing customer | #7 → `"ddupeFlag":"Y"`, `"lenderCustomerId":"CIF-9"` | `customerCreation` + `dedupeRetry` `SKIPPED` |
-| Narrower fan-out | #2 → `"aadhaar_checks_needed":"false"` | 2 branches instead of 4 |
-| Poll → park | leave #12 on `PENDING` | after 30 polls → `AWAITING_MANUAL_RETRY` |
-| Account rejected | #11 → `"statusCode":"406"` | `REJECTED` at `accountInfo` |
-
-### Switching the config over
-
-```bash
-sed -i '' 's#"baseUrl": "http://localhost:9099"#"baseUrl": "https://YOUR-ENDPOINT.free.beeceptor.com"#g' \
-  src/main/resources/lender-config.json
-```
-
-**What Beeceptor cannot do:** rules 12, 14, 16 are poll endpoints, and a static
-rule returns the same body forever — so a poll either succeeds immediately or
-never. To demo "polls three times, then succeeds" you edit the rule body in the
-web UI *while the flow is mid-poll*. The local mock flips on a counter instead,
-which is why it is the default here.
-
----
-
-## 9. Troubleshooting
+## A4. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -517,7 +1165,7 @@ pkill -f "temporal server start-dev"        # server
 
 ---
 
-## 10. Architecture — how Temporal is working here
+## A5. Architecture — how Temporal is working here
 
 Three tiers, and one inversion that explains most of the operational properties.
 
@@ -736,13 +1384,13 @@ None are blockers. They are the three numbers a skeptical reviewer will probe:
 
 ---
 
-## 11. Design decisions — the two a reviewer will push on
+## A6. Design decisions — the two a reviewer will push on
 
 Both of these are places where the POC deliberately picked one side of a
 tradeoff. Neither choice is obviously right; both need a different answer in
 production, and the reasoning is more useful than the verdict.
 
-### 11.1 UI naming — dynamic activity vs `setSummary`
+### A6.1 UI naming — dynamic activity vs `setSummary`
 
 **The problem.** The Temporal UI labels every box in the timeline graph from
 `ActivityTaskScheduled.activityType.name`. With one generic `execute` method
@@ -865,7 +1513,7 @@ plus one custom metric emitted from inside `StageActivityImpl` with a curated
 label set (`lender`, `call`, `outcome`) — so you own the cardinality budget
 instead of inheriting it from config edits.
 
-### 11.2 Config snapshot — loaded once per execution
+### A6.2 Config snapshot — loaded once per execution
 
 > **Resolved — see [CONFIG-DESIGN.md](CONFIG-DESIGN.md).** Everything this
 > section argued for is now implemented: the two-tier split became a three-plane
@@ -873,7 +1521,7 @@ instead of inheriting it from config edits.
 > activity on every attempt**), config moved to an external store, and the
 > "explicit escape hatch" became `onFailure: PARK` plus the `retryStep` signal.
 > The analysis below is kept because it is still the reasoning, and §11.2's
-> "where the snapshot hurts" cases are exactly what §12 now demonstrates fixing.
+> "where the snapshot hurts" cases are exactly what scenarios S6 and S7 now fix live.
 
 **Correcting a comment in the code.** The original `StageActivity.loadConfig`'s
 javadoc said
@@ -955,168 +1603,72 @@ this converges on.
 
 ---
 
-## 12. Hot config demo — fix a live loan without a redeploy
+## A7. Alternative — Beeceptor instead of the local mock
 
-This is the sequence that was actually run to validate the design. The worker
-starts **once** and is never restarted. See
-[CONFIG-DESIGN.md](CONFIG-DESIGN.md) for why each step is safe.
+Derived by walking `lender-config.json`, so every field below is one the
+interpreter actually reads. **17 rules** — federal 14 + demobank 3. (README
+says "the 11 below fit" and then lists 14; both are wrong.)
 
-Terminals 0–3 from §4 must be up.
+**One endpoint hosts both lenders** — no path collisions. Point both `baseUrl`s
+at the same host.
 
-### 12.1 Start a loan and see config provenance
+> ⚠️ **Use exact-path matching, not prefix.** demobank's `/precheck` is a prefix
+> of federal's `/precheck/name-dob`. A prefix rule for `/precheck` swallows all
+> four federal precheck routes.
 
-```bash
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-2001"
-sleep 40
-temporal workflow query -w lender-flow-LR-2001 --type status
-```
+All rules return **HTTP 200** — the workflow branches on body, not status code.
 
-Every completed step carries the `bindingVersion` it went out with, and the
-status shows `skeletonVersion` / `transportVersion` / `lastBindingVersion`. That
-answers "what contract did this call actually use" months later, from history
-alone.
+### Federal — 14 rules
 
-The loan is now parked on `eSignWait` waiting for `pledgeCardReady`.
+| # | Method | Path | Response body |
+|---|---|---|---|
+| 1 | POST | `/precheck/name-dob` | `{"status":"SUCCESS"}` |
+| 2 | POST | `/precheck/dedupe` | `{"status":"SUCCESS","data":{"ddupe_flag":"N","customer_id":"","aadhaar_checks_needed":"true"}}` |
+| 3 | POST | `/precheck/pan` | `{"panStatusCode":"E","status":"SUCCESS"}` |
+| 4 | POST | `/precheck/un-name` | `{"status":"S"}` |
+| 5 | POST | `/precheck/pan-aadhaar` | `{"status":"SUCCESS"}` |
+| 6 | POST | `/precheck/mobile-aadhaar` | `{"status":"SUCCESS"}` |
+| 7 | POST | `/stp/dedupe` | `{"ddupeFlag":"N","partialKycFlag":"N","lenderCustomerId":""}` |
+| 8 | POST | `/stp/customer-creation` | `{"responseCode":"00","customerId":"CIF-1001","partialKycFlag":"N"}` |
+| 9 | POST | `/stp/dedupe-retry` | `{"lenderCustomerId":"CIF-1001"}` |
+| 10 | POST | `/stp/customer-info` | `{"status":"SUCCESS","referenceNumber":"REF-1"}` |
+| 11 | POST | `/stp/account-info` | `{"statusCode":"200","status":"SUCCESS","loanAccountNumber":"LA-77001"}` |
+| 12 | **GET** | `/stp/loan-status` | `{"loanStatus":"PENDING"}` — flip to `SUCCESS` mid-demo |
+| 13 | POST | `/ft/pledge-card` | `{"statusCode":"200","bpmNumber":"BPM-9001"}` |
+| 14 | **GET** | `/ft/status` | `{"status":"PENDING"}` — flip to `{"status":"SUCCESS","utr":"UTR123456789"}` |
 
-### 12.2 Break the config under the running loan
+### DemoBank — 3 rules
 
-```bash
-# file store — one document
-python3 -c "
-import json; p='config-store/bindings/federal/b1/FUND_TRANSFER.pledgeCardSend.json'
-d=json.load(open(p)); d['path']='/broken/pledge-card'; json.dump(d,open(p,'w'),indent=2)"
+| # | Method | Path | Response body |
+|---|---|---|---|
+| 15 | POST | `/precheck` | `{"verdict":"PASS","custRef":"DEMO-CUST-1"}` |
+| 16 | **GET** | `/sanction/status` | `{"state":"PENDING"}` — flip to `APPROVED` |
+| 17 | POST | `/disburse` | `{"ok":"true","utr":"UTR-DEMO-999"}` |
 
-# or Mongo — one updateOne
-docker exec mongodb mongosh lender_config --quiet --eval \
-  'db.bindings.updateOne({_id:"federal:b1:FUND_TRANSFER.pledgeCardSend"},
-                         {$set:{path:"/broken/pledge-card"}})'
+Rule 17: `successWhen` compares `$.ok EQUALS "true"` as a **string** — quote it.
 
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-2001 pledgeCardReady"
-sleep 40
-temporal workflow query -w lender-flow-LR-2001 --type status
-```
+### Beeceptor scenario matrix
 
-The step retries per config, exhausts, and **parks** rather than failing the loan:
+| Scenario | Edit | Expected |
+|---|---|---|
+| Business rejection | #3 → `{"panStatusCode":"F"}` | `REJECTED`, zero retries |
+| Technical failure | #7 → HTTP **500** | 3 retries, 2s→4s→8s, then `FAILED` |
+| Existing customer | #7 → `"ddupeFlag":"Y"`, `"lenderCustomerId":"CIF-9"` | `customerCreation` + `dedupeRetry` `SKIPPED` |
+| Narrower fan-out | #2 → `"aadhaar_checks_needed":"false"` | 2 branches instead of 4 |
+| Poll → park | leave #12 on `PENDING` | after 30 polls → `AWAITING_MANUAL_RETRY` |
+| Account rejected | #11 → `"statusCode":"406"` | `REJECTED` at `accountInfo` |
 
-```
-"parkedAt":       "FUND_TRANSFER/pledgeCardSend"
-"waitingOnSignal": "retryStep"
-   FUND_TRANSFER  pledgeCardSend  AWAITING_INTERVENTION  retries exhausted: ... HTTP 404
-```
-
-Before this change that loan would be `FAILED` and would need a Temporal Reset.
-
-### 12.3 Fix it and resume — still no redeploy
-
-```bash
-docker exec mongodb mongosh lender_config --quiet --eval \
-  'db.bindings.updateOne({_id:"federal:b1:FUND_TRANSFER.pledgeCardSend"},
-                         {$set:{path:"/ft/pledge-card"}})'
-
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-2001 retryStep"
-sleep 30
-temporal workflow show -w lender-flow-LR-2001 | grep Status
-```
-→ `COMPLETED`.
-
-### 12.4 Change the API payload shape at runtime
-
-Rewrite a flat payload into a nested, typed one — the kind of change that used to
-be a code change. Note the deliberately missing `branchCode`:
+### Switching the config over
 
 ```bash
-python3 - <<'EOF'
-import json
-p = 'config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json'
-d = json.load(open(p))
-d['request'] = {
-  "requestId":    "${ctx._requestId}",
-  "applicant":    {"name": "${ctx.customerName | upper}",
-                   "dob":  "${ctx.dob}",
-                   "pan":  "${ctx.pan}"},
-  "amount":       "${num:ctx.loanAmount ?: 150000}",
-  "consent":      "${bool:ctx.consentGiven ?: \"true\"}",
-  "branchCode":   "${ctx.branchCode}",
-  "?middleName":  "${ctx.middleName}"
-}
-json.dump(d, open(p, 'w'), indent=2)
-EOF
-
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="start federal LR-2002"
-sleep 35
-temporal workflow query -w lender-flow-LR-2002 --type status
+sed -i '' 's#"baseUrl": "http://localhost:9099"#"baseUrl": "https://YOUR-ENDPOINT.free.beeceptor.com"#g' \
+  src/main/resources/lender-config.json
 ```
 
-Strict mode refuses to send a blank into a lender payload, and says exactly what
-is wrong and which binding version said it:
+**What Beeceptor cannot do:** rules 12, 14, 16 are poll endpoints, and a static
+rule returns the same body forever — so a poll either succeeds immediately or
+never. To demo "polls three times, then succeeds" you edit the rule body in the
+web UI *while the flow is mid-poll*. The local mock flips on a counter instead,
+which is why it is the default here.
 
-```
-parkedAt: PRECHECK/nameDobCheck
-AWAITING_INTERVENTION | retries exhausted: ... [binding b1]
-  unresolved template ${ctx.branchCode} — context has no value for 'ctx.branchCode'
-  and no ?: default was given
-```
-
-The old renderer did `ctx.getOrDefault(key, "")` and would have sent
-`"branchCode": ""` to the bank without a word.
-
-Add the default and release it:
-
-```bash
-python3 - <<'EOF'
-import json
-p = 'config-store/bindings/federal/b1/PRECHECK.nameDobCheck.json'
-d = json.load(open(p))
-d['request']['branchCode'] = '${ctx.branchCode ?: "BLR-001"}'
-json.dump(d, open(p, 'w'), indent=2)
-EOF
-
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-2002 retryStep"
-sleep 45
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="signal LR-2002 pledgeCardReady"
-sleep 30
-temporal workflow show -w lender-flow-LR-2002 | grep Status
-```
-→ `COMPLETED`, nested typed payload and all.
-
-### 12.5 Publish and roll back a version
-
-```js
-// copy every call document to a new version, edit what you need, then flip
-db.bindings.find({lenderSlug:"federal", bindingVersion:"b1"}).forEach(d => {
-  d._id = d._id.replace(":b1:", ":b2:");  d.bindingVersion = "b2";
-  db.bindings.insertOne(d);
-});
-db.bindings.updateOne({_id:"federal:b2:STP.customerInfo"},
-                      {$set:{path:"/stp/v2/customer-info"}});
-db.pointers.updateOne({_id:"federal"}, {$set:{bindingVersion:"b2"}});
-```
-
-Rollback is the same edit with `b1`. Versions are immutable; only `pointer.json`
-moves. In-flight loans pick the new version up on their next activity attempt.
-
-### 12.6 Prove the shape is pinned
-
-Publish `skeleton-v2` with an extra step and flip `skeletonVersion`. A loan
-already running keeps the shape it started with; a loan started afterwards gets
-the new one. Both on the same worker, same binary. This is covered by
-`skeletonChange_doesNotLeakIntoARunningExecution` in the test suite.
-
-### 12.7 Run it against Mongo instead of files
-
-```bash
-docker run -d --name mongodb -p 27017:27017 mongo:7.0
-export CONFIG_STORE=mongo
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="seed"
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="show federal"
-mvn -o exec:java -Dexec.mainClass=com.rupeek.poc.temporal.Runner -Dexec.args="worker federal"
-```
-
-Same seven collections, same behaviour, verified end to end. Useful queries:
-
-```js
-db.getCollectionNames()                                         // 7 collections
-db.bindings.find({lenderSlug:"federal", stage:"FUND_TRANSFER"})  // per-stage view
-db.stage_knobs.findOne({_id:"federal:t1:PRECHECK"})              // one stage's knobs
-db.pointers.findOne({_id:"federal"})                             // what is live
-```
+---

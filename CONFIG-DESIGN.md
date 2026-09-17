@@ -210,10 +210,47 @@ The full ladder, cheapest first:
 | 6 | shape wrong (missing/reordered step) | publish new skeleton → applies to **new** loans. Stuck loan: Temporal **Reset** | past is not editable |
 | 7 | unrecoverable | terminate + manual compensation | — |
 
-**PARALLEL steps never park**, and this is intentional: re-running a fan-out would
-re-fire branches that already succeeded, and a gate failure is a decision, not a
-transient fault. **`BUSINESS_REJECT` never parks** either — a lender decline is an
-answer, and no config edit turns it into a yes.
+**PARALLEL steps park too**, and re-run only the branches that failed. The earlier
+objection — re-running a fan-out would re-fire branches that already succeeded —
+is answered by tracking per-branch outcomes across rounds, so a branch that
+succeeded is never called twice however many times the step parks. Verified by
+`parkedFanout_reRunsOnlyTheFailedBranch_onRetryStep` and, live, by the mock's own
+request counts.
+
+Every mode that can suffer a *technical* failure now parks: SYNC, POLL and
+PARALLEL. `AWAIT_SIGNAL` does not, because it is already a wait with its own
+timeout.
+
+**`BUSINESS_REJECT` never parks** — a lender decline is an answer, and no config
+edit turns it into a yes.
+
+The park window is `parkTimeoutHours`, **72h by default — the same three days as
+the e-sign wait**. There is no reason for an operator to get less time to rescue a
+loan than a customer gets to sign one. On timeout the loan fails with
+`TECHNICAL_FAILURE`.
+
+### A loan that did not complete FAILS the execution
+
+Returning a `FlowResult` with `outcome=FAILED` left the workflow green and
+"Completed" in the Temporal UI, so a broken loan was indistinguishable from a
+disbursed one in the list — which is where anyone looks first. A non-COMPLETED
+outcome now throws, and the loan shows **red**.
+
+The failure type keeps the two cases apart:
+
+| outcome | UI status | failure type |
+|---|---|---|
+| COMPLETED | Completed | — |
+| REJECTED | **Failed** | `BUSINESS_REJECT` |
+| FAILED | **Failed** | `TECHNICAL_FAILURE` |
+
+The whole `FlowResult` rides along as failure details, so the final context and
+step history stay visible on the UI's failure panel and `status()` still answers.
+
+**The trade-off, stated plainly:** with declines and outages both showing as
+`Failed`, "failed workflow count" is no longer an alerting signal on its own — it
+has to be filtered by failure type, or a busy day of rejections looks like an
+incident. That was a deliberate choice for UI clarity over metric purity.
 
 ---
 
@@ -225,9 +262,15 @@ answer, and no config edit turns it into a yes.
 |---|---|
 | a binding edit mid-backoff heals a live loan, no redeploy | `bindingEditedMidRetry_healsTheLoan_withNoRedeploy` |
 | retries exhaust → park → fix → `retryStep` → complete | `stepParks_whenRetriesExhaust_thenRetryStepResumesWithFixedConfig` |
-| a decline never parks | `businessReject_neverParks` |
+| a decline never parks, even inside a fan-out | `businessReject_neverParks` |
+| a failed fan-out branch parks, and only it re-runs | `parkedFanout_reRunsOnlyTheFailedBranch_onRetryStep` |
+| a fan-out keeps sibling results while parked | `parallelBranchFailure_keepsSuccessfulSiblingResults_thenParks` |
 | **history replays clean after config changed mid-flight** | `replayIsClean_afterTheBindingChangedMidFlight` |
 | a shape change does not leak into a running loan, but does apply to the next one | `skeletonChange_doesNotLeakIntoARunningExecution` |
+| an operator can supply a value config cannot reach | `patchContext_suppliesAValueConfigCannotReach_thenTheParkedStepCompletes` |
+| identity keys cannot be patched | `patchContext_refusesIdentityKeys` |
+| **reading config from workflow code breaks replay** | `ConfigDeterminismTest#readingConfigFromWorkflowCode_breaksReplayWhenTheConfigChanges` |
+| **reading it through an activity does not** | `ConfigDeterminismTest#readingConfigThroughAnActivityReplaysCleanlyUnderTheSameChange` |
 | nested/typed payloads, defaults, optional keys | `TemplateRendererTest` |
 | strict mode fails loudly instead of sending `""` | `strictMode_failsLoudly_insteadOfSendingAnEmptyString` |
 | array indexing + regex extraction | `extraction_supports*` |
@@ -255,6 +298,99 @@ started **once and never restarted**:
    and a deliberately missing field → strict mode caught it and parked with
    `unresolved template ${ctx.branchCode} … [binding b1]`.
 5. A `?:` default was added and `retryStep` sent → the loan **completed**.
+
+---
+
+## 6b. Code review findings
+
+A review pass over the implementation found two real defects and two robustness
+gaps. All four are fixed; they are recorded here because each is a class of bug
+this architecture makes *easier* to introduce, not just a one-off.
+
+### Fixed — a typo'd context reference was shipped as a literal
+
+`${cts.pan}` (note the typo) resolved to the **literal string `"cts.pan"`** and
+was sent to the lender in the payload. `lookup()` treated any unrecognised bare
+token as a literal, so there was no way to misspell a context key loudly.
+
+Head position now requires `ctx.<key>` or a quoted `"literal"`; a bare token
+throws and names the fix. A bare token *after* `?:` is still a literal, which is
+what keeps `${num:ctx.loanAmount ?: 150000}` readable. This is the same class of
+bug as the old `getOrDefault(key, "")` — a silently wrong value in a money-moving
+request — and hot-editable config makes it more likely, not less, because nobody
+compiles a config edit.
+
+### Fixed — a config typo could hang a loan instead of failing it
+
+`Predicates.evaluate` throws `IllegalArgumentException` on an unknown `op`, and
+`step.mode` could be null. Both were raw exceptions thrown from **workflow**
+code, and the Java SDK retries a failed *workflow task* forever — so a typo in a
+condition produced a loan that hung silently with no outcome and a repeating
+`WorkflowTaskFailed`, which is far worse than a clean failure.
+
+Both are now converted to non-retryable `CONFIG_ERROR` `ApplicationFailure`s, and
+a workflow-side predicate carrying a response `path` instead of `ctx` is rejected
+with a message saying where it belongs.
+
+### Documented — a stray `retryStep` short-circuits the next park
+
+`retryStepSignal` is not cleared when a step parks, only when the wait completes.
+That is deliberate: it means a `retryStep` sent while the step was still on its
+last retry is honoured a moment later when it parks, which is the realistic ops
+sequence. The cost is that a stray signal sent when nothing is parked will
+release the *next* park immediately. It is self-correcting — the step re-runs and
+re-parks — but confusing in a log, so it now logs a warning saying exactly that.
+
+### Deliberate — the command sequence DID move, once
+
+Making a non-COMPLETED loan fail the execution changes the final command from
+`CompleteWorkflowExecution` to `FailWorkflowExecution`. That is a
+**replay-breaking change**: deploying it while a loan is mid-flight and heading
+for a rejection would stall that loan on a non-determinism error.
+
+The fixture net caught it — `business-reject.json` was the one history whose
+terminal event changed, and it was regenerated deliberately. For a POC this is
+fine. In production this change needs `Workflow.getVersion` or a drain before it
+reaches workers serving in-flight loans. The other five fixtures were unaffected,
+which is the useful signal: adding park support to PARALLEL did **not** move the
+command sequence for flows that never hit that path.
+
+### Verified — nothing else moved
+
+All six committed history fixtures in `src/test/resources/histories/` replay
+cleanly against the reviewed code (`ReplayCompatibilityTest`). Logging, guards
+and the renderer fix changed no commands, which is the property that matters:
+a change that moved the sequence would stall every in-flight loan on the next
+deploy.
+
+---
+
+## 6c. Logging
+
+The POC logs every config-driven decision with the value it was based on, because
+"why did this step do that" is the question a config-driven flow gets asked most.
+
+- **Request/response**: method, URL, headers, and full raw bodies both ways, per
+  attempt. `LOG_RAW=false` suppresses bodies — they carry PAN, Aadhaar reference
+  and mobile, and raw-body logging must not ship (§7.16).
+- **Config provenance**: every attempt logs `RESOLVED callKey=... binding=...`,
+  which makes the hot-config mechanism visible — you can watch an edit land
+  between attempt 2 and attempt 3.
+- **Conditions and predicates**: `ctx.customerId BLANK [actual=CIF-1001] -> false`,
+  and `successWhen: $.status EQUALS SUCCESS | actual=SUCCESS -> true`.
+- **Gate decisions**: branch launches with their effective retry, the settle-all
+  join, and the single go/no-go verdict.
+- **Recovery**: park, the exact `Runner signal <id> retryStep` command to run, and
+  the release.
+
+One implementation detail that is not optional: the workflow logs through
+`Workflow.getLogger(...)`, which is **replay-aware**. A plain slf4j logger in
+workflow code re-emits every line on every replay, so a parked loan's log would
+read as though the flow ran dozens of times. Activities do not replay and use a
+normal logger, stamped with the Temporal attempt number.
+
+See `RUNBOOK.md` §13 for annotated output, including the `mvn -q` gotcha that
+silences all of it.
 
 ---
 
@@ -317,8 +453,12 @@ and most of it is where a production schedule actually goes.
 12. **PARK has no bound in practice.** It waits 7 days and there is no alerting,
     no dashboard, and no cap on how many times a step may park.
 13. **`retryStep` is a blunt instrument.** One signal releases whichever step is
-    parked. Production wants the step identity in the signal payload, plus
-    `patchContext` / `skipStep` operator updates (heavily audited).
+    parked; production wants the step identity in the signal payload. `skipStep`
+    does not exist. `patchContext` **does** now exist (see the recovery ladder) —
+    but it is a signal, so it is fire-and-forget with no synchronous rejection,
+    it has no schema or type checking on the values it writes, and authorisation
+    is "whoever can reach the Temporal frontend". Production wants it as an
+    `@UpdateMethod` with validation, an actor identity, and a reason string.
 14. **A parked-then-retried step generates a new `_requestId`.** Deliberate
     re-fire is usually what you want, but it means the idempotency key changes —
     which is only safe once #1 is done and the key is derived from stable uids.

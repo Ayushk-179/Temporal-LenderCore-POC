@@ -54,6 +54,14 @@ public interface ConfigStore {
 
     void write(String collection, String id, JsonNode doc);
 
+    /**
+     * Wipe every collection. Used only by `Runner reset`: re-seeding OVERWRITES
+     * the seeded documents but leaves anything a scenario published behind — a
+     * b2 binding version, an extra stage — so the next scenario would start from
+     * a store that is not actually pristine.
+     */
+    void clear();
+
     List<String> lenders();
 
     /** Human-readable location, printed on worker boot so a demo cannot lie to you. */

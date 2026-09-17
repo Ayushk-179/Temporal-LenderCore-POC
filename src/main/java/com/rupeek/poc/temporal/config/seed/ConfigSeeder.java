@@ -145,11 +145,17 @@ public final class ConfigSeeder {
                 step.signalName = lstep.signalName;
                 step.timeoutHours = lstep.timeoutHours;
 
-                // Only SYNC and POLL park. A PARALLEL step cannot: re-running it
-                // would re-fire branches that already succeeded, and a fan-out
-                // gate failure is a decision, not a transient fault.
-                step.onFailure = ("SYNC".equalsIgnoreCase(lstep.mode)
-                        || "POLL".equalsIgnoreCase(lstep.mode)) ? "PARK" : "FAIL";
+                // Every mode that can suffer a TECHNICAL failure parks rather than
+                // killing the loan: SYNC, POLL and PARALLEL. A parked PARALLEL step
+                // re-runs only the branches that failed, so branches that already
+                // succeeded are never re-fired.
+                //
+                // AWAIT_SIGNAL is excluded because it has no technical failure mode
+                // — it is already a wait, with its own timeout.
+                //
+                // A BUSINESS_REJECT never parks whatever this says: a lender decline
+                // is an answer, and no config edit turns it into a yes.
+                step.onFailure = "AWAIT_SIGNAL".equalsIgnoreCase(lstep.mode) ? "FAIL" : "PARK";
 
                 String stepKey = ls.name + "." + lstep.name;
 

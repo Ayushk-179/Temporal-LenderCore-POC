@@ -14,6 +14,7 @@ import io.temporal.failure.ApplicationFailure;
 import io.temporal.workflow.ActivityStub;
 import io.temporal.workflow.Promise;
 import io.temporal.workflow.Workflow;
+import org.slf4j.Logger;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -53,6 +54,17 @@ import java.util.Set;
  */
 public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
 
+    /**
+     * Workflow.getLogger, NOT LoggerFactory.getLogger.
+     *
+     * A workflow method re-executes from the top on every replay. A plain slf4j
+     * logger would re-emit every line each time a worker picks the workflow up —
+     * so a loan that parks for a day would print its PRECHECK log dozens of times
+     * and the log would read like the flow ran dozens of times. This logger is
+     * replay-aware and suppresses output while replaying.
+     */
+    private static final Logger log = Workflow.getLogger(LenderFlowWorkflowImpl.class);
+
     private final Map<String, String> ctx = new LinkedHashMap<>();
     private final List<StepRecord> history = new ArrayList<>();
 
@@ -82,6 +94,9 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         ctx.put("loanRequestId", input.loanRequestId);
         ctx.put("lenderSlug", input.lenderSlug);
 
+        log.info("=== FLOW START lender={} loanRequestId={} workflowId={} seedKeys={}",
+                lenderSlug, loanRequestId, Workflow.getInfo().getWorkflowId(), input.seed.keySet());
+
         // Short-timeout stub for the two config-reading activities. Config reads
         // must retry — the store is a dependency now, and an outage at a stage
         // boundary should stall, not fail, the loan.
@@ -99,6 +114,9 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         // ---- resolution point 1: ONCE. Pinned in history for the life of the loan.
         FlowSkeleton skeleton = configActivities.loadFlowSkeleton(lenderSlug);
         skeletonVersion = skeleton.version;
+        log.info("CONFIG pinned skeleton={} ({} stages: {}) — this shape is now fixed "
+                        + "for the life of this loan",
+                skeleton.version, skeleton.stages.size(), stageNames(skeleton));
 
         FlowResult result = new FlowResult();
 
@@ -110,23 +128,34 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                 // while this loan was in PRECHECK reaches its FUND_TRANSFER steps.
                 StageKnobs knobs = configActivities.loadStageKnobs(lenderSlug, stage.name);
                 transportVersion = knobs.transportVersion;
+                log.info("--- STAGE {} [{} steps] knobs re-read from transport={} "
+                                + "(retry {}x initial {}s x{} backoff, timeout {}s)",
+                        stage.name, stage.steps.size(), knobs.transportVersion,
+                        knobs.retry.maximumAttempts, knobs.retry.initialIntervalSeconds,
+                        knobs.retry.backoffCoefficient, knobs.timeoutSeconds);
 
                 for (FlowSkeleton.Step step : stage.steps) {
                     currentStep = step.name;
+                    String where = stage.name + "/" + step.name;
 
-                    if (!conditionHolds(step.condition)) {
+                    if (!conditionHolds(step.condition, where)) {
+                        log.info("STEP {} SKIPPED — {}", where, describe(step.condition));
                         history.add(new StepRecord(stage.name, step.name, "SKIPPED", 0,
-                                "condition not met"));
+                                "condition not met: " + describe(step.condition)));
                         continue;
                     }
+                    log.info("STEP {} mode={} onFailure={}", where, step.mode, step.onFailure);
                     runStep(stage, step, knobs);
                 }
             }
             result.outcome = "COMPLETED";
+            log.info("=== FLOW COMPLETED lender={} loanRequestId={} ctxKeys={}",
+                    lenderSlug, loanRequestId, ctx.keySet());
         } catch (ActivityFailure af) {
             result.outcome = isBusinessReject(af) ? "REJECTED" : "FAILED";
             result.failedAt = currentStage + "/" + currentStep;
             result.reason = rootMessage(af);
+            log.error("=== FLOW {} at {} — {}", result.outcome, result.failedAt, result.reason);
             history.add(new StepRecord(currentStage, currentStep, result.outcome, 0, result.reason));
         } catch (ApplicationFailure af) {
             // Thrown by the workflow itself — today only the PARALLEL gate, which
@@ -140,10 +169,35 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                     ? "REJECTED" : "FAILED";
             result.failedAt = currentStage + "/" + currentStep;
             result.reason = af.getOriginalMessage();
+            log.error("=== FLOW {} at {} — {}", result.outcome, result.failedAt, result.reason);
             history.add(new StepRecord(currentStage, currentStep, result.outcome, 0, result.reason));
         }
 
         result.finalContext = new LinkedHashMap<>(ctx);
+
+        // A loan that did not complete FAILS THE EXECUTION, so it shows red in the
+        // Temporal UI instead of green "Completed". Returning a FlowResult with
+        // outcome=FAILED made a broken loan indistinguishable from a disbursed one
+        // in the workflow list — which is where anyone looks first.
+        //
+        // The failure TYPE keeps the two apart for metrics and for anyone filtering:
+        //   BUSINESS_REJECT    the lender said no. Normal, expected, high volume.
+        //   TECHNICAL_FAILURE  something broke, or a parked step was never rescued.
+        //
+        // Worth knowing: with both shown as Failed, "failed workflow count" alone is
+        // not an alerting signal — it has to be filtered by type, or a busy day of
+        // declines looks like an outage.
+        //
+        // The whole FlowResult rides along as failure details, so the final context
+        // and step history stay visible on the UI's failure panel.
+        if (!"COMPLETED".equals(result.outcome)) {
+            throw ApplicationFailure.newNonRetryableFailure(
+                    result.outcome + " at " + result.failedAt + " — " + result.reason,
+                    "REJECTED".equals(result.outcome)
+                            ? StageActivityImpl.BUSINESS_REJECT
+                            : StageActivityImpl.TECHNICAL_FAILURE,
+                    result);
+        }
         return result;
     }
 
@@ -166,6 +220,13 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
      */
     private void runStep(FlowSkeleton.Stage stage, FlowSkeleton.Step step, StageKnobs knobs) {
         StageKnobs effective = knobs;
+        if (step.mode == null) {
+            // A config error must fail the execution loudly. A raw NPE here would
+            // fail the WORKFLOW TASK instead, and the Java SDK retries those
+            // forever — the loan would hang with no outcome and no error.
+            throw ApplicationFailure.newNonRetryableFailure(
+                    "Step " + stage.name + "/" + step.name + " has no mode", "CONFIG_ERROR");
+        }
         while (true) {
             try {
                 switch (step.mode.toUpperCase()) {
@@ -187,16 +248,25 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                 }
             } catch (ActivityFailure af) {
                 if (!"PARK".equalsIgnoreCase(step.onFailure) || isBusinessReject(af)) {
+                    log.error("STEP {}/{} FAILED (onFailure={}, businessReject={}) — {}",
+                            stage.name, step.name, step.onFailure, isBusinessReject(af),
+                            rootMessage(af));
                     throw af;
                 }
                 parkedAt = stage.name + "/" + step.name;
+                log.warn("STEP {} PARKED — retries exhausted: {}", parkedAt, rootMessage(af));
+                log.warn("STEP {} waiting up to {}h for retryStep. Fix the binding document "
+                                + "in the config store, then: Runner signal {} retryStep",
+                        parkedAt, step.parkTimeoutHours, loanRequestId);
                 history.add(new StepRecord(stage.name, step.name, "AWAITING_INTERVENTION", 0,
                         "retries exhausted: " + rootMessage(af)
                                 + " — fix the binding in the config store, then signal retryStep"));
 
-                boolean released = awaitRetryStep(Duration.ofDays(7));
+                boolean released = awaitRetryStep(Duration.ofHours(step.parkTimeoutHours));
                 parkedAt = null;
                 if (!released) {
+                    log.error("STEP {}/{} park timed out after {}h without retryStep",
+                            stage.name, step.name, step.parkTimeoutHours);
                     throw af;
                 }
 
@@ -204,6 +274,10 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                 // only a binding change, so re-read this stage's slice too.
                 effective = configActivities.loadStageKnobs(lenderSlug, stage.name);
                 transportVersion = effective.transportVersion;
+                log.info("STEP {}/{} RELEASED by retryStep — re-resolving config "
+                                + "(transport={}, retry {}x) and re-running the step",
+                        stage.name, step.name, effective.transportVersion,
+                        effective.retry.maximumAttempts);
                 history.add(new StepRecord(stage.name, step.name, "RETRYING", 0,
                         "released by retryStep; config re-resolved (transport "
                                 + effective.transportVersion + ")"));
@@ -220,6 +294,8 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                 request(stage, step, step.name, callKey));
         ctx.putAll(res.extracted);
         lastBindingVersion = res.bindingVersion;
+        log.info("STEP {}/{} SUCCESS http={} binding={} extracted={}",
+                stage.name, step.name, res.httpStatus, res.bindingVersion, res.extracted);
         history.add(new StepRecord(stage.name, step.name, "SUCCESS", 1,
                 "http " + res.httpStatus, res.bindingVersion));
     }
@@ -240,103 +316,205 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
      *      so a partial fan-out is not discarded;
      *   4. the go/no-go decision is taken once, after the join.
      */
-    private void runParallel(FlowSkeleton.Stage stage, FlowSkeleton.Step step, StageKnobs knobs) {
-        List<FlowSkeleton.Branch> launched = new ArrayList<>();
-        List<Promise<StageActivity.CallResult>> promises = new ArrayList<>();
+    private void runParallel(FlowSkeleton.Stage stage, FlowSkeleton.Step step,
+                             StageKnobs knobs) {
+        StageKnobs effective = knobs;
 
+        // Branch conditions are evaluated ONCE, before the first round. Re-checking
+        // them after a park could change the fan-out width halfway through a step.
+        List<FlowSkeleton.Branch> enabled = new ArrayList<>();
         for (FlowSkeleton.Branch branch : step.branches) {
-            if (!conditionHolds(branch.condition)) {
+            String where = stage.name + "/" + step.name + "/" + branch.name;
+            if (!conditionHolds(branch.condition, where)) {
+                log.info("BRANCH {} SKIPPED — {}", where, describe(branch.condition));
                 ctx.put(branchKey(step, branch.name), "SKIPPED");
                 history.add(new StepRecord(stage.name, step.name + "/" + branch.name,
-                        "SKIPPED", 0, "condition not met"));
+                        "SKIPPED", 0, "condition not met: " + describe(branch.condition)));
                 continue;
             }
-            String callKey = callKey(stage, step, branch.name);
-            promises.add(stub(knobs, callKey).executeAsync(
-                    activityName(stage, branch.name), StageActivity.CallResult.class,
-                    request(stage, step, branch.name, callKey)));
-            launched.add(branch);
+            enabled.add(branch);
         }
 
-        if (promises.isEmpty()) {
+        if (enabled.isEmpty()) {
             ctx.put(decisionKey(step), "PROCEED");
+            log.info("FANOUT {}/{} no branches enabled by config -> PROCEED",
+                    stage.name, step.name);
             history.add(new StepRecord(stage.name, step.name, "SKIPPED", 0, "no branches enabled"));
             return;
         }
 
-        // ---------------------------------------------------------- settle all
-        List<String> succeeded = new ArrayList<>();
-        List<String> failed = new ArrayList<>();
-        List<String> rejected = new ArrayList<>();
-        List<String> blocking = new ArrayList<>();
+        // Cumulative across rounds: a branch that succeeded in round 1 is never
+        // re-fired, however many times the step parks.
+        Map<String, String> outcome = new LinkedHashMap<>();
+        int round = 0;
 
-        for (int i = 0; i < promises.size(); i++) {
-            FlowSkeleton.Branch branch = launched.get(i);
-            String status;
-            String detail;
-            String bindingVersion = null;
-            try {
-                StageActivity.CallResult r = promises.get(i).get();
-                // Declared order, not completion order: the merge stays deterministic.
-                ctx.putAll(r.extracted);
-                lastBindingVersion = r.bindingVersion;
-                bindingVersion = r.bindingVersion;
-                status = "SUCCESS";
-                detail = "http " + r.httpStatus;
-                succeeded.add(branch.name);
-            } catch (ActivityFailure af) {
-                boolean reject = isBusinessReject(af);
-                status = reject ? "REJECTED" : "FAILED";
-                detail = rootMessage(af);
-                (reject ? rejected : failed).add(branch.name);
-                if (reject || branch.mandatory) {
-                    blocking.add(branch.name + "(" + status + ")");
+        while (true) {
+            round++;
+            List<FlowSkeleton.Branch> toRun = new ArrayList<>();
+            for (FlowSkeleton.Branch b : enabled) {
+                if (!"SUCCESS".equals(outcome.get(b.name))) {
+                    toRun.add(b);
                 }
             }
-            ctx.put(branchKey(step, branch.name), status);
-            history.add(new StepRecord(stage.name, step.name + "/" + branch.name, status, 1,
-                    detail, bindingVersion));
+
+            List<Promise<StageActivity.CallResult>> promises = new ArrayList<>();
+            for (FlowSkeleton.Branch branch : toRun) {
+                String callKey = callKey(stage, step, branch.name);
+                log.info("BRANCH {}/{}/{} LAUNCH (round {}) mandatory={} retry={}x timeout={}s",
+                        stage.name, step.name, branch.name, round, branch.mandatory,
+                        effective.retryFor(callKey).maximumAttempts,
+                        effective.timeoutFor(callKey));
+                promises.add(stub(effective, callKey).executeAsync(
+                        activityName(stage, branch.name), StageActivity.CallResult.class,
+                        request(stage, step, branch.name, callKey)));
+            }
+            log.info("FANOUT {}/{} round {} awaiting {} branch(es) — settle-all, not fail-fast",
+                    stage.name, step.name, round, promises.size());
+
+            // ------------------------------------------------------ settle all
+            List<String> rejected = new ArrayList<>();
+            for (int i = 0; i < promises.size(); i++) {
+                FlowSkeleton.Branch branch = toRun.get(i);
+                String status;
+                String detail;
+                String bindingVersion = null;
+                try {
+                    StageActivity.CallResult r = promises.get(i).get();
+                    // Declared order, not completion order: the merge stays deterministic.
+                    ctx.putAll(r.extracted);
+                    lastBindingVersion = r.bindingVersion;
+                    bindingVersion = r.bindingVersion;
+                    status = "SUCCESS";
+                    detail = "http " + r.httpStatus;
+                    log.info("BRANCH {}/{}/{} SUCCESS http={} binding={} extracted={}",
+                            stage.name, step.name, branch.name, r.httpStatus,
+                            r.bindingVersion, r.extracted);
+                } catch (ActivityFailure af) {
+                    boolean reject = isBusinessReject(af);
+                    status = reject ? "REJECTED" : "FAILED";
+                    detail = rootMessage(af);
+                    if (reject) {
+                        rejected.add(branch.name);
+                    }
+                    log.warn("BRANCH {}/{}/{} {} (mandatory={}) — {}",
+                            stage.name, step.name, branch.name, status, branch.mandatory, detail);
+                }
+                outcome.put(branch.name, status);
+                ctx.put(branchKey(step, branch.name), status);
+                history.add(new StepRecord(stage.name, step.name + "/" + branch.name, status,
+                        round, detail, bindingVersion));
+            }
+
+            // ---------------------------- tally the full picture, across all rounds
+            List<String> succeeded = new ArrayList<>();
+            List<String> failed = new ArrayList<>();
+            List<String> blocking = new ArrayList<>();
+            for (FlowSkeleton.Branch b : enabled) {
+                String o = outcome.get(b.name);
+                if ("SUCCESS".equals(o)) {
+                    succeeded.add(b.name);
+                } else {
+                    // REJECTED counts as failed for the gate; it is handled below.
+                    failed.add(b.name);
+                    if (b.mandatory || "REJECTED".equals(o)) {
+                        blocking.add(b.name);
+                    }
+                }
+            }
+
+            // Set BEFORE the rejection check: a stopped fan-out must still leave a
+            // readable tally in context for the status query and for downstream
+            // conditions.
+            ctx.put(step.name + ".successCount", String.valueOf(succeeded.size()));
+            ctx.put(step.name + ".branchCount", String.valueOf(enabled.size()));
+            ctx.put(step.name + ".rejectedCalls", String.join(",", rejected));
+            List<String> technicallyFailed = new ArrayList<>(failed);
+            technicallyFailed.removeAll(rejected);
+            ctx.put(step.name + ".failedCalls", String.join(",", technicallyFailed));
+
+            // A decline stops the flow whatever the gate or onFailure says. Retrying
+            // cannot change it and no config edit can turn it into a yes, so it must
+            // never park.
+            if (!rejected.isEmpty()) {
+                ctx.put(decisionKey(step), "STOP");
+                log.error("GATE {}/{} STOP — lender declined: {}", stage.name, step.name, rejected);
+                throw ApplicationFailure.newNonRetryableFailure(
+                        step.name + " rejected by lender: " + String.join(", ", rejected),
+                        StageActivityImpl.BUSINESS_REJECT);
+            }
+
+            boolean quorumMet = step.minSuccess <= 0 || succeeded.size() >= step.minSuccess;
+            String summary = succeeded.size() + "/" + enabled.size() + " ok"
+                    + (blocking.isEmpty() ? "" : "; blocking: " + String.join(", ", blocking))
+                    + (quorumMet ? "" : "; minSuccess=" + step.minSuccess + " not met");
+            log.info("GATE {}/{} {} | quorumMet={} (minSuccess={}) onBranchFailure={}",
+                    stage.name, step.name, summary, quorumMet, step.minSuccess,
+                    step.onBranchFailure);
+
+            if (blocking.isEmpty() && quorumMet) {
+                ctx.put(decisionKey(step), failed.isEmpty() ? "PROCEED" : "PROCEED_DEGRADED");
+                log.info("GATE {}/{} -> {}", stage.name, step.name, ctx.get(decisionKey(step)));
+                history.add(new StepRecord(stage.name, step.name,
+                        failed.isEmpty() ? "SUCCESS" : "PARTIAL_SUCCESS", enabled.size(),
+                        "parallel: " + summary
+                                + (failed.isEmpty() ? "" : "; tolerated: " + String.join(", ", failed))));
+                return;
+            }
+
+            if ("CONTINUE".equalsIgnoreCase(step.onBranchFailure)) {
+                ctx.put(decisionKey(step), "PROCEED_DEGRADED");
+                log.warn("GATE {}/{} -> PROCEED_DEGRADED (onBranchFailure=CONTINUE tolerated {})",
+                        stage.name, step.name, blocking);
+                history.add(new StepRecord(stage.name, step.name, "PARTIAL_SUCCESS", enabled.size(),
+                        "parallel: " + summary + "; onBranchFailure=CONTINUE"));
+                return;
+            }
+
+            // The gate is not met and the failures are TECHNICAL. Park instead of
+            // killing the loan, and on release re-run ONLY the failed branches —
+            // re-firing a branch that already succeeded could double-charge a
+            // lender-side side effect.
+            if (!"PARK".equalsIgnoreCase(step.onFailure)) {
+                ctx.put(decisionKey(step), "STOP");
+                log.error("GATE {}/{} STOP — {}", stage.name, step.name, summary);
+                throw ApplicationFailure.newNonRetryableFailure(
+                        step.name + " gate not met: " + summary,
+                        StageActivityImpl.TECHNICAL_FAILURE);
+            }
+
+            parkedAt = stage.name + "/" + step.name;
+            log.warn("FANOUT {} PARKED — {} ({} branch(es) still failing: {})",
+                    parkedAt, summary, failed.size(), failed);
+            log.warn("FANOUT {} waiting up to {}h for retryStep. Fix the binding(s), then: "
+                            + "Runner signal {} retryStep — only {} will re-run",
+                    parkedAt, step.parkTimeoutHours, loanRequestId, failed);
+            history.add(new StepRecord(stage.name, step.name, "AWAITING_INTERVENTION",
+                    enabled.size(), "gate not met: " + summary
+                            + " — fix the binding(s) in the config store, then signal retryStep; "
+                            + "only " + String.join(", ", failed) + " will re-run"));
+
+            boolean released = awaitRetryStep(Duration.ofHours(step.parkTimeoutHours));
+            parkedAt = null;
+            if (!released) {
+                ctx.put(decisionKey(step), "STOP");
+                log.error("FANOUT {}/{} park timed out after {}h without retryStep",
+                        stage.name, step.name, step.parkTimeoutHours);
+                throw ApplicationFailure.newNonRetryableFailure(
+                        step.name + " parked " + step.parkTimeoutHours
+                                + "h without retryStep: " + summary,
+                        StageActivityImpl.TECHNICAL_FAILURE);
+            }
+
+            effective = configActivities.loadStageKnobs(lenderSlug, stage.name);
+            transportVersion = effective.transportVersion;
+            log.info("FANOUT {}/{} RELEASED by retryStep — re-resolving config (transport={}) "
+                            + "and re-running {} only",
+                    stage.name, step.name, effective.transportVersion, failed);
+            history.add(new StepRecord(stage.name, step.name, "RETRYING", enabled.size(),
+                    "released by retryStep; re-running " + String.join(", ", failed)));
         }
-
-        // ------------------------------------------------------- decide, once
-        ctx.put(step.name + ".successCount", String.valueOf(succeeded.size()));
-        ctx.put(step.name + ".branchCount", String.valueOf(promises.size()));
-        ctx.put(step.name + ".failedCalls", String.join(",", failed));
-        ctx.put(step.name + ".rejectedCalls", String.join(",", rejected));
-
-        boolean quorumMet = step.minSuccess <= 0 || succeeded.size() >= step.minSuccess;
-        String summary = succeeded.size() + "/" + promises.size() + " ok"
-                + (blocking.isEmpty() ? "" : "; blocking: " + String.join(", ", blocking))
-                + (quorumMet ? "" : "; minSuccess=" + step.minSuccess + " not met");
-
-        if (!rejected.isEmpty()) {
-            ctx.put(decisionKey(step), "STOP");
-            throw ApplicationFailure.newNonRetryableFailure(
-                    step.name + " rejected by lender: " + String.join(", ", rejected)
-                            + " [" + summary + "]",
-                    StageActivityImpl.BUSINESS_REJECT);
-        }
-
-        if (blocking.isEmpty() && quorumMet) {
-            ctx.put(decisionKey(step), failed.isEmpty() ? "PROCEED" : "PROCEED_DEGRADED");
-            history.add(new StepRecord(stage.name, step.name,
-                    failed.isEmpty() ? "SUCCESS" : "PARTIAL_SUCCESS", promises.size(),
-                    "parallel: " + summary
-                            + (failed.isEmpty() ? "" : "; tolerated: " + String.join(", ", failed))));
-            return;
-        }
-
-        if ("CONTINUE".equalsIgnoreCase(step.onBranchFailure)) {
-            ctx.put(decisionKey(step), "PROCEED_DEGRADED");
-            history.add(new StepRecord(stage.name, step.name, "PARTIAL_SUCCESS", promises.size(),
-                    "parallel: " + summary + "; onBranchFailure=CONTINUE"));
-            return;
-        }
-
-        ctx.put(decisionKey(step), "STOP");
-        throw ApplicationFailure.newNonRetryableFailure(
-                step.name + " gate not met: " + summary, StageActivityImpl.TECHNICAL_FAILURE);
     }
+
 
     /**
      * Durable polling. No PendingCorrelation document, no poll_lock, no
@@ -354,6 +532,9 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
                     request(stage, step, step.name, callKey));
             ctx.putAll(res.extracted);
             lastBindingVersion = res.bindingVersion;
+            log.info("POLL {}/{} attempt {}/{} http={} terminal={} binding={} extracted={}",
+                    stage.name, step.name, attempt, step.maxAttempts, res.httpStatus,
+                    res.terminal, res.bindingVersion, res.extracted);
 
             if (res.terminal) {
                 history.add(new StepRecord(stage.name, step.name, "SUCCESS", attempt,
@@ -363,32 +544,43 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
 
             if (attempt >= step.maxAttempts) {
                 if (!"AWAIT_SIGNAL".equalsIgnoreCase(step.onExhausted)) {
+                    log.error("POLL {}/{} exhausted {} attempts, onExhausted=FAIL",
+                            stage.name, step.name, step.maxAttempts);
                     throw ApplicationFailure.newNonRetryableFailure(
                             step.name + " exhausted " + step.maxAttempts + " polls",
                             "POLL_EXHAUSTED");
                 }
+                log.warn("POLL {}/{} exhausted {} attempts -> parking on signal '{}'",
+                        stage.name, step.name, step.maxAttempts, step.exhaustedSignalName);
                 // Park for a human. Mirrors the BPMN receiveTask, minus the BPMN.
                 history.add(new StepRecord(stage.name, step.name, "AWAITING_MANUAL_RETRY",
                         attempt, "signal: " + step.exhaustedSignalName));
-                awaitNamedSignal(step.exhaustedSignalName, Duration.ofDays(7));
+                awaitNamedSignal(step.exhaustedSignalName, Duration.ofHours(step.parkTimeoutHours));
                 attempt = 0;   // matches prod: counter resets on manual resume
                 continue;
             }
 
+            log.debug("POLL {}/{} sleeping {}s (durable — survives worker restart)",
+                    stage.name, step.name, step.pollIntervalSeconds);
             Workflow.sleep(Duration.ofSeconds(step.pollIntervalSeconds));
         }
     }
 
     /** E-sign wait. Days long, zero resource cost, survives everything. */
     private void runAwaitSignal(FlowSkeleton.Stage stage, FlowSkeleton.Step step) {
+        log.info("WAIT {}/{} awaiting signal '{}' for up to {}h (zero resource cost)",
+                stage.name, step.name, step.signalName, step.timeoutHours);
         history.add(new StepRecord(stage.name, step.name, "WAITING", 0,
                 "signal: " + step.signalName));
         boolean got = awaitNamedSignal(step.signalName, Duration.ofHours(step.timeoutHours));
         if (!got) {
+            log.error("WAIT {}/{} timed out after {}h waiting for '{}'",
+                    stage.name, step.name, step.timeoutHours, step.signalName);
             throw ApplicationFailure.newNonRetryableFailure(
                     step.name + " timed out after " + step.timeoutHours + "h waiting for "
                             + step.signalName, "SIGNAL_TIMEOUT");
         }
+        log.info("WAIT {}/{} signal '{}' received", stage.name, step.name, step.signalName);
         history.add(new StepRecord(stage.name, step.name, "SUCCESS", 1, "signal received"));
     }
 
@@ -417,8 +609,22 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         }
     }
 
+    /**
+     * Note the deliberate asymmetry: the flag is NOT cleared on entry, so a
+     * retryStep sent while the step was still on its last retry is still honoured
+     * when it parks a moment later — which is the realistic ops sequence ("I fixed
+     * it, release it"). The cost is that a stray retryStep sent when nothing is
+     * parked will short-circuit the NEXT park. That is self-correcting (the step
+     * simply re-runs and re-parks) but it is confusing in a log, so it is called
+     * out explicitly.
+     */
     private boolean awaitRetryStep(Duration timeout) {
         waitingOnSignal = "retryStep";
+        if (retryStepSignal) {
+            log.warn("retryStep was already pending when this step parked — releasing "
+                    + "immediately without waiting. If nobody just fixed config, this step "
+                    + "will fail again and park again.");
+        }
         try {
             boolean r = Workflow.await(timeout, () -> retryStepSignal);
             retryStepSignal = false;
@@ -435,22 +641,75 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         if (payload != null) {
             ctx.putAll(payload);
         }
+        log.info("SIGNAL payload merged into ctx: {}",
+                payload == null ? "(none)" : payload.keySet());
+        log.info("SIGNAL received: pledgeCardReady"); 
         pledgeCardSignal = true;
     }
 
     @Override
     public void retryLoanStatus() {
+        log.info("SIGNAL received: retryLoanStatus"); 
         retryLoanStatusSignal = true;
     }
 
     @Override
     public void retryFundTransferStatus() {
+        log.info("SIGNAL received: retryFundTransferStatus"); 
         retryFundTransferSignal = true;
     }
 
     @Override
     public void retryStep() {
+        log.info("SIGNAL received: retryStep"); 
         retryStepSignal = true;
+    }
+
+    /**
+     * Keys that identify the loan or are derived per call. Letting an operator
+     * rewrite loanRequestId would re-point every downstream idempotency key at a
+     * different loan; _requestId is regenerated per attempt anyway, so patching it
+     * only creates confusion.
+     */
+    private static final Set<String> PROTECTED_CTX_KEYS = new LinkedHashSet<>(
+            java.util.Arrays.asList("loanRequestId", "lenderSlug", "_requestId"));
+
+    @Override
+    public void patchContext(Map<String, String> patch) {
+        if (patch == null || patch.isEmpty()) {
+            log.warn("SIGNAL patchContext ignored — empty patch");
+            return;
+        }
+        Map<String, String> applied = new LinkedHashMap<>();
+        List<String> refused = new ArrayList<>();
+        for (Map.Entry<String, String> e : patch.entrySet()) {
+            if (PROTECTED_CTX_KEYS.contains(e.getKey())) {
+                refused.add(e.getKey());
+                continue;
+            }
+            applied.put(e.getKey(), e.getValue());
+        }
+
+        if (!refused.isEmpty()) {
+            log.error("SIGNAL patchContext REFUSED protected key(s) {} — these identify the "
+                    + "loan and rewriting them would re-point its idempotency keys", refused);
+        }
+        if (applied.isEmpty()) {
+            history.add(new StepRecord(currentStage, currentStep, "CONTEXT_PATCH_REFUSED", 0,
+                    "all keys protected: " + refused));
+            return;
+        }
+
+        Map<String, String> before = new LinkedHashMap<>();
+        applied.keySet().forEach(k -> before.put(k, ctx.get(k)));
+        ctx.putAll(applied);
+
+        // Loud on purpose: this edits live loan state by hand.
+        log.warn("SIGNAL patchContext APPLIED {} (was {}){}",
+                applied, before, refused.isEmpty() ? "" : "; refused " + refused);
+        history.add(new StepRecord(currentStage, currentStep, "CONTEXT_PATCHED", 0,
+                "operator set " + applied.keySet() + " (was " + before + ")"
+                        + (refused.isEmpty() ? "" : "; refused " + refused)));
     }
 
     @Override
@@ -541,11 +800,56 @@ public class LenderFlowWorkflowImpl implements LenderFlowWorkflow {
         return step.name + ".decision";
     }
 
-    private boolean conditionHolds(Predicate p) {
+    /**
+     * Workflow-side conditions read the workflow CONTEXT only. A predicate with a
+     * response {@code path} belongs on the binding (successWhen / terminalWhen /
+     * businessRejectWhen) and is evaluated inside the activity.
+     *
+     * Both failure modes here are config errors, and both are converted to a
+     * NON-RETRYABLE ApplicationFailure on purpose. A raw IllegalArgumentException
+     * or NPE thrown from workflow code fails the WORKFLOW TASK, and the Java SDK
+     * retries workflow tasks forever — the loan would hang silently with no
+     * outcome. Converting makes a typo in config fail the loan loudly instead.
+     */
+    private boolean conditionHolds(Predicate p, String where) {
         if (p == null) {
             return true;
         }
-        return Predicates.evaluate(p, ctx.get(p.ctx));
+        if (p.ctx == null) {
+            throw ApplicationFailure.newNonRetryableFailure(
+                    "Condition at " + where + " has no 'ctx' field. Workflow-side conditions "
+                            + "read workflow context only; a response 'path' predicate belongs "
+                            + "on the binding as successWhen/terminalWhen/businessRejectWhen.",
+                    "CONFIG_ERROR");
+        }
+        boolean holds;
+        try {
+            holds = Predicates.evaluate(p, ctx.get(p.ctx));
+        } catch (IllegalArgumentException e) {
+            throw ApplicationFailure.newNonRetryableFailure(
+                    "Condition at " + where + ": " + e.getMessage(), "CONFIG_ERROR");
+        }
+        log.info("CONDITION {} : {} -> {}", where, describe(p), holds);
+        return holds;
+    }
+
+    /** Renders a predicate and the value it saw, so a skipped step explains itself. */
+    private String describe(Predicate p) {
+        if (p == null) {
+            return "(no condition)";
+        }
+        String op = p.op == null ? "EQUALS" : p.op.toUpperCase();
+        StringBuilder sb = new StringBuilder("ctx.").append(p.ctx).append(' ').append(op);
+        if (!"BLANK".equals(op) && !"NOT_BLANK".equals(op)) {
+            sb.append(' ').append(p.values != null && !p.values.isEmpty() ? p.values : p.value);
+        }
+        return sb.append(" [actual=").append(ctx.get(p.ctx)).append(']').toString();
+    }
+
+    private String stageNames(FlowSkeleton skeleton) {
+        List<String> names = new ArrayList<>();
+        skeleton.stages.forEach(st -> names.add(st.name));
+        return String.join(" -> ", names);
     }
 
     private boolean isBusinessReject(ActivityFailure af) {

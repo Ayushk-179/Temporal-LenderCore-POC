@@ -39,6 +39,22 @@ public interface LenderFlowWorkflow {
     void retryStep();
 
     /**
+     * Operator escape hatch: write values straight into the workflow context of a
+     * RUNNING loan.
+     *
+     * For the case config cannot reach — a value nobody captured, that the lender
+     * now requires. Park the step, patch the missing key in, signal retryStep, and
+     * the re-run renders it.
+     *
+     * This is the most dangerous thing in the API: it edits live loan state with
+     * no schema and no validation, and the change is permanent in history. It is
+     * recorded in the step history and logged loudly for exactly that reason, and
+     * a small set of identity keys is refused outright.
+     */
+    @SignalMethod
+    void patchContext(Map<String, String> patch);
+
+    /**
      * Live progress without Operate and without a DB read. This is what an ops
      * screen or a support engineer calls to answer "where is this loan stuck, and
      * which config version is it running".

@@ -2,6 +2,8 @@ package com.rupeek.poc.temporal.config.store;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -9,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -30,6 +33,7 @@ import java.util.stream.Stream;
 public class FileConfigStore implements ConfigStore {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(FileConfigStore.class);
 
     private final Path root;
 
@@ -62,6 +66,7 @@ public class FileConfigStore implements ConfigStore {
         if (!Files.exists(p)) {
             return null;
         }
+        log.debug("read {}/{} <- {}", collection, id, p);
         try {
             return MAPPER.readTree(Files.readAllBytes(p));
         } catch (IOException e) {
@@ -99,9 +104,29 @@ public class FileConfigStore implements ConfigStore {
         try {
             Files.createDirectories(p.getParent());
             Files.write(p, MAPPER.writerWithDefaultPrettyPrinter().writeValueAsBytes(doc));
+            log.debug("wrote {}/{} -> {}", collection, id, p);
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot write config document " + id, e);
         }
+    }
+
+    @Override
+    public void clear() {
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(root)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Cannot delete " + p, e);
+                }
+            });
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot clear " + root, e);
+        }
+        log.debug("cleared {}", root);
     }
 
     @Override

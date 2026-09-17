@@ -77,6 +77,14 @@ public class FlowSkeleton {
          * a fault, and no config edit can change it.
          */
         public String onFailure = "FAIL";
+
+        /**
+         * How long a PARKed step waits for retryStep before giving up, in hours.
+         * Defaults to 72 — the same three days as the e-sign wait, because both
+         * are "a human has to do something" waits and there is no reason for an
+         * operator to get less time than a customer.
+         */
+        public int parkTimeoutHours = 72;
     }
 
     /** One member of a PARALLEL fan-out: identity and gate role only. */

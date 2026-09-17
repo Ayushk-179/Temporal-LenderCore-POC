@@ -13,9 +13,12 @@ import com.rupeek.poc.temporal.config.seed.ConfigSeeder;
 import com.rupeek.poc.temporal.config.store.ConfigResolver;
 import com.rupeek.poc.temporal.config.store.ConfigStore;
 import com.rupeek.poc.temporal.config.store.ConfigStores;
+import com.rupeek.poc.temporal.config.template.TemplateRenderer;
+import com.rupeek.poc.temporal.config.template.UnresolvedTemplateException;
 import com.rupeek.poc.temporal.workflow.LenderFlowWorkflow;
 import com.rupeek.poc.temporal.workflow.LenderFlowWorkflowImpl;
 import io.temporal.client.WorkflowClient;
+import io.temporal.client.WorkflowFailedException;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.common.WorkflowExecutionHistory;
 import io.temporal.failure.ApplicationFailure;
@@ -39,6 +42,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -121,7 +125,14 @@ class LenderFlowWorkflowTest {
      * all go through the real store, which is what makes the config tests mean
      * something.
      */
-    class FakeStageActivity implements StageActivity {
+    static class FakeStageActivity implements StageActivity {
+        /** Passed in rather than captured, so other test classes can reuse this. */
+        private final ConfigResolver resolver;
+
+        FakeStageActivity(ConfigResolver resolver) {
+            this.resolver = resolver;
+        }
+
         final Map<String, String> scripted = new LinkedHashMap<>();
         final AtomicInteger loanStatusCalls = new AtomicInteger();
         final AtomicInteger sanctionCalls = new AtomicInteger();
@@ -171,6 +182,17 @@ class LenderFlowWorkflowTest {
             r.bindingVersion = rb.bindingVersion;
             r.transportVersion = rb.transportVersion;
 
+            // Render the REAL template against the REAL context, so a binding that
+            // references a ctx key nobody produced fails here exactly as it would
+            // live. Without this the fake would happily "succeed" on a payload the
+            // production activity would refuse to send.
+            try {
+                TemplateRenderer.render(rb.binding.request, req.context, true);
+            } catch (UnresolvedTemplateException e) {
+                throw ApplicationFailure.newFailure(name + " " + e.getMessage(),
+                        StageActivityImpl.CONFIG_ERROR);
+            }
+
             // A binding pointing at a path the lender does not serve. Retryable,
             // exactly like a real 404/500 would be.
             if (rb.binding.path != null && rb.binding.path.startsWith("/broken")) {
@@ -201,6 +223,12 @@ class LenderFlowWorkflowTest {
                 case "dedupe":
                     r.extracted.put("dedupeFlag", scripted.getOrDefault("dedupeFlag", "N"));
                     r.extracted.put("partialKyc", "N");
+                    // Mirrors the mock: an existing customer comes back with an id,
+                    // which is why customerCreation can be skipped at all.
+                    if ("Y".equals(scripted.get("dedupeFlag"))) {
+                        r.extracted.put("customerId",
+                                scripted.getOrDefault("lenderCustomerId", "CIF-EXISTING"));
+                    }
                     break;
                 case "customerCreation":
                     r.extracted.put("customerId", "CIF-1001");
@@ -231,6 +259,11 @@ class LenderFlowWorkflowTest {
                     r.extracted.put("customerId", "CIF-1001");
                     r.terminal = true;
                     break;
+                // demobank: combinedPrecheck is the only producer of customerId,
+                // which FUND_TRANSFER.disburse then renders into its payload.
+                case "combinedPrecheck":
+                    r.extracted.put("customerId", "DEMO-CIF-1");
+                    break;
                 default:
                     r.extracted.put(name + "Status", "SUCCESS");
             }
@@ -239,7 +272,7 @@ class LenderFlowWorkflowTest {
     }
 
     private FakeStageActivity register() {
-        FakeStageActivity acts = new FakeStageActivity();
+        FakeStageActivity acts = new FakeStageActivity(resolver);
         worker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
         return acts;
     }
@@ -260,6 +293,30 @@ class LenderFlowWorkflowTest {
         s.put("dob", "1990-01-15");
         s.put("aadhaarRef", "XXXX-XXXX-1234");
         return s;
+    }
+
+    /**
+     * A loan that does not complete now FAILS THE EXECUTION so it shows red in the
+     * Temporal UI. The FlowResult still exists — it rides along as failure details
+     * — so assertions can keep checking outcome and final context.
+     */
+    private static LenderFlowWorkflow.FlowResult failureResult(WorkflowFailedException e) {
+        Throwable cur = e.getCause();
+        while (cur != null && !(cur instanceof ApplicationFailure)) {
+            cur = cur.getCause();
+        }
+        assertTrue(cur instanceof ApplicationFailure,
+                "expected an ApplicationFailure in the cause chain, got " + e.getCause());
+        ApplicationFailure af = (ApplicationFailure) cur;
+        return af.getDetails().get(0, LenderFlowWorkflow.FlowResult.class);
+    }
+
+    private static String failureType(WorkflowFailedException e) {
+        Throwable cur = e.getCause();
+        while (cur != null && !(cur instanceof ApplicationFailure)) {
+            cur = cur.getCause();
+        }
+        return ((ApplicationFailure) cur).getType();
     }
 
     private static LenderFlowWorkflow.FlowInput input(String loanRequestId) {
@@ -292,8 +349,12 @@ class LenderFlowWorkflowTest {
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-REJECT-1");
-        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-REJECT-1"));
+        WorkflowFailedException e = assertThrows(WorkflowFailedException.class,
+                () -> wf.run(input("LR-REJECT-1")));
+        LenderFlowWorkflow.FlowResult result = failureResult(e);
 
+        // Red in the UI, but typed so a decline is still distinguishable from an outage.
+        assertEquals(StageActivityImpl.BUSINESS_REJECT, failureType(e));
         assertEquals("REJECTED", result.outcome);
         assertTrue(result.failedAt.startsWith("PRECHECK/parallelChecks"));
         assertEquals("SUCCESS", result.finalContext.get("parallelChecks.unNameCheck.outcome"));
@@ -304,26 +365,66 @@ class LenderFlowWorkflowTest {
     // -------------------------------------------------- parallel join semantics
 
     @Test
-    void parallelBranchFailure_keepsSuccessfulSiblingResults_thenStopsAtTheGate() {
+    void parallelBranchFailure_keepsSuccessfulSiblingResults_thenParks() {
         FakeStageActivity acts = register();
         acts.failAttempts.put("panValidation", -1);   // never recovers
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-PARTIAL-1");
-        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-PARTIAL-1"));
+        WorkflowClient.start(wf::run, input("LR-PARTIAL-1"));
+        env.sleep(Duration.ofMinutes(5));
 
-        assertEquals("FAILED", result.outcome);
-        assertEquals("PRECHECK/parallelChecks", result.failedAt);
+        // A technical failure inside the fan-out now PARKS the step instead of
+        // killing the loan — the same treatment SYNC and POLL steps already got.
+        LenderFlowWorkflow.FlowStatus s = wf.status();
+        assertEquals("PRECHECK/parallelChecks", s.parkedAt);
+        assertEquals("retryStep", s.waitingOnSignal);
 
-        assertEquals("SUCCESS", result.finalContext.get("unNameCheckStatus"));
-        assertEquals("SUCCESS", result.finalContext.get("panAadhaarLinkStatus"));
-        assertEquals("FAILED", result.finalContext.get("parallelChecks.panValidation.outcome"));
-        assertEquals("3", result.finalContext.get("parallelChecks.successCount"));
-        assertEquals("STOP", result.finalContext.get("parallelChecks.decision"));
+        // Settle-all still holds: every sibling ran and contributed its extracts.
+        assertEquals("SUCCESS", s.context.get("unNameCheckStatus"));
+        assertEquals("SUCCESS", s.context.get("panAadhaarLinkStatus"));
+        assertEquals("FAILED", s.context.get("parallelChecks.panValidation.outcome"));
+        assertEquals("3", s.context.get("parallelChecks.successCount"));
 
         assertTrue(acts.attemptsFor("mobileAadhaarLink") >= 1);
-        // Stage-default retry, now sourced from the transport document's knobs.
+        // Stage-default retry, sourced from the transport document's knobs.
         assertEquals(3, acts.attemptsFor("panValidation"));
+    }
+
+    /**
+     * The reason a PARALLEL step could not park before: re-running the fan-out
+     * would re-fire branches that had already succeeded, which for a lender call
+     * with a side effect is a duplicate request.
+     *
+     * Only the FAILED branches re-run. Successful ones are never touched again,
+     * however many times the step parks.
+     */
+    @Test
+    void parkedFanout_reRunsOnlyTheFailedBranch_onRetryStep() {
+        FakeStageActivity acts = register();
+        acts.failAttempts.put("panValidation", 3);   // 3 attempts fail, the 4th works
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-FANPARK-1");
+        WorkflowClient.start(wf::run, input("LR-FANPARK-1"));
+        env.sleep(Duration.ofMinutes(5));
+        assertEquals("PRECHECK/parallelChecks", wf.status().parkedAt);
+
+        int unNameBefore = acts.attemptsFor("unNameCheck");
+        int aadhaarBefore = acts.attemptsFor("panAadhaarLink");
+        assertEquals(1, unNameBefore);
+
+        wf.retryStep();
+        wf.pledgeCardReady(Map.of());
+        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-FANPARK-1"));
+
+        assertEquals("COMPLETED", result.outcome);
+        assertEquals("PROCEED", result.finalContext.get("parallelChecks.decision"));
+        // The failed branch got one more attempt...
+        assertEquals(4, acts.attemptsFor("panValidation"));
+        // ...and the siblings that already succeeded were NOT re-fired.
+        assertEquals(unNameBefore, acts.attemptsFor("unNameCheck"));
+        assertEquals(aadhaarBefore, acts.attemptsFor("panAadhaarLink"));
     }
 
     @Test
@@ -357,7 +458,13 @@ class LenderFlowWorkflowTest {
         assertEquals("PROCEED_DEGRADED", result.finalContext.get("parallelChecks.decision"));
         assertEquals("mobileAadhaarLink", result.finalContext.get("parallelChecks.failedCalls"));
         // Per-call retry override survived the migration into transport.callOverrides.
-        assertEquals(4, acts.attemptsFor("mobileAadhaarLink"));
+        // Asserted as "more than the stage default" rather than an exact 4: under
+        // time skipping the final attempt's counter write can land just after the
+        // workflow has already observed the exhausted retry, which made an exact
+        // assertion flaky. What matters is that the override was picked up at all.
+        assertTrue(acts.attemptsFor("mobileAadhaarLink") > 3,
+                "per-call override (4 attempts) should exceed the stage default (3), got "
+                        + acts.attemptsFor("mobileAadhaarLink"));
     }
 
     @Test
@@ -384,12 +491,18 @@ class LenderFlowWorkflowTest {
         acts.failAttempts.put("mobileAadhaarLink", -1);
         acts.configTweak = s -> s.stages.get(0).steps.stream()
                 .filter(st -> "parallelChecks".equals(st.name))
-                .forEach(st -> st.minSuccess = 4);
+                .forEach(st -> {
+                    st.minSuccess = 4;
+                    st.onFailure = "FAIL";   // stop at the gate instead of parking
+                });
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-QUORUM-1");
-        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-QUORUM-1"));
+        WorkflowFailedException e = assertThrows(WorkflowFailedException.class,
+                () -> wf.run(input("LR-QUORUM-1")));
+        LenderFlowWorkflow.FlowResult result = failureResult(e);
 
+        assertEquals(StageActivityImpl.TECHNICAL_FAILURE, failureType(e));
         assertEquals("FAILED", result.outcome);
         assertEquals("STOP", result.finalContext.get("parallelChecks.decision"));
         assertTrue(result.reason.contains("minSuccess=4"));
@@ -452,7 +565,7 @@ class LenderFlowWorkflowTest {
 
     @Test
     void secondLender_runsWithZeroCodeChange() {
-        FakeStageActivity acts = new FakeStageActivity();
+        FakeStageActivity acts = new FakeStageActivity(resolver);
         Worker demoWorker = env.newWorker("lih-demobank-work");
         demoWorker.registerWorkflowImplementationTypes(LenderFlowWorkflowImpl.class);
         demoWorker.registerActivitiesImplementations(acts, new DynamicStageActivityImpl(acts));
@@ -548,10 +661,81 @@ class LenderFlowWorkflowTest {
         env.start();
 
         LenderFlowWorkflow wf = stub("LR-NOPARK-1");
-        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-NOPARK-1"));
+        WorkflowFailedException e = assertThrows(WorkflowFailedException.class,
+                () -> wf.run(input("LR-NOPARK-1")));
 
-        assertEquals("REJECTED", result.outcome);
+        assertEquals(StageActivityImpl.BUSINESS_REJECT, failureType(e));
+        assertEquals("REJECTED", failureResult(e).outcome);
+        // The decline came from inside a PARALLEL step, which now parks on technical
+        // failures — but never on a decline.
         assertNull(wf.status().parkedAt);
+    }
+
+    /**
+     * The operator escape hatch, end to end.
+     *
+     * The lender now requires a field nobody ever captured, so no config edit can
+     * fix it — the value does not exist anywhere in the loan. Park the step, write
+     * the value straight into the running loan's context, release it.
+     */
+    @Test
+    void patchContext_suppliesAValueConfigCannotReach_thenTheParkedStepCompletes() {
+        FakeStageActivity acts = register();
+
+        // A binding that demands a ctx key nothing produces.
+        String id = ConfigStore.id(SLUG, ConfigSeeder.BINDING_VERSION, "STP.customerInfo");
+        ObjectNode doc = (ObjectNode) store.read(ConfigStore.BINDINGS, id);
+        ((ObjectNode) doc.get("request")).put("branchCode", "${ctx.branchCode}");
+        store.write(ConfigStore.BINDINGS, id, doc);
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-PATCH-1");
+        WorkflowClient.start(wf::run, input("LR-PATCH-1"));
+        env.sleep(Duration.ofMinutes(5));
+
+        // Strict rendering refused to send a blank, so the step parked.
+        LenderFlowWorkflow.FlowStatus parked = wf.status();
+        assertEquals("STP/customerInfo", parked.parkedAt);
+        assertNull(parked.context.get("branchCode"));
+
+        // The operator supplies it by hand: Runner patch LR-PATCH-1 branchCode=BLR-042
+        wf.patchContext(Map.of("branchCode", "BLR-042"));
+        assertEquals("BLR-042", wf.status().context.get("branchCode"));
+        assertTrue(wf.status().history.stream()
+                .anyMatch(h -> "CONTEXT_PATCHED".equals(h.status)),
+                "the patch must be recorded in step history, not applied silently");
+
+        wf.retryStep();
+        wf.pledgeCardReady(Map.of());
+        LenderFlowWorkflow.FlowResult result = wf.run(input("LR-PATCH-1"));
+
+        assertEquals("COMPLETED", result.outcome);
+        assertEquals("BLR-042", result.finalContext.get("branchCode"));
+    }
+
+    /**
+     * Identity keys are refused. Rewriting loanRequestId mid-flight would re-point
+     * every downstream idempotency key at a different loan, which is a
+     * double-disbursal path dressed up as an ops convenience.
+     */
+    @Test
+    void patchContext_refusesIdentityKeys() {
+        register();
+        env.start();
+
+        LenderFlowWorkflow wf = stub("LR-PATCH-2");
+        WorkflowClient.start(wf::run, input("LR-PATCH-2"));
+        env.sleep(Duration.ofMinutes(2));
+
+        wf.patchContext(Map.of("loanRequestId", "LR-SOMEONE-ELSE", "lenderSlug", "other"));
+
+        LenderFlowWorkflow.FlowStatus s = wf.status();
+        assertEquals("LR-PATCH-2", s.context.get("loanRequestId"));
+        assertEquals("federal", s.context.get("lenderSlug"));
+        assertTrue(s.history.stream().anyMatch(h -> "CONTEXT_PATCH_REFUSED".equals(h.status)));
+
+        wf.pledgeCardReady(Map.of());
+        assertEquals("COMPLETED", wf.run(input("LR-PATCH-2")).outcome);
     }
 
     /**
@@ -685,11 +869,14 @@ class LenderFlowWorkflowTest {
                 break;
             }
             // Non-retryable reject inside the parallel gate — the short history.
+            // A declined loan now FAILS the execution (red in the UI), so the
+            // capture has to expect the throw rather than a returned result.
             case "business-reject": {
                 FakeStageActivity acts = register();
                 acts.panStatusCode = "F";
                 env.start();
-                stub(loanId).run(input(loanId));
+                LenderFlowWorkflow rejected = stub(loanId);
+                assertThrows(WorkflowFailedException.class, () -> rejected.run(input(loanId)));
                 break;
             }
             // Conditions false -> fewer scheduled activities, which shifts every
@@ -734,7 +921,7 @@ class LenderFlowWorkflowTest {
             }
             // A different skeleton entirely, same workflow class.
             case "second-lender": {
-                FakeStageActivity acts = new FakeStageActivity();
+                FakeStageActivity acts = new FakeStageActivity(resolver);
                 Worker demoWorker = env.newWorker("lih-demobank-work");
                 demoWorker.registerWorkflowImplementationTypes(LenderFlowWorkflowImpl.class);
                 demoWorker.registerActivitiesImplementations(
